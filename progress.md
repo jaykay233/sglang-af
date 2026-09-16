@@ -1313,3 +1313,128 @@ Zero errors in either arm. Remaining Attn-side host work, by the §19.3 shares:
 Reproduce §19.2: add `SGLANG_AFD_TIMELINE=1` plus
 `SGLANG_AFD_TIMELINE_OUT=/tmp/tl.txt`; the summary is rewritten by the Attn
 process every 512 completes and on exit.
+
+## 20. NA1F FFN poll: a real head-of-line block (fixed), but no throughput win
+
+§18 closed the FFN-batching line and §19 moved the lever to the Attn host path.
+This section tests the *other* lever suggested for the FFN: multiple independent
+Attn workers feeding one FFN (**2A1F**). Before building anything, two bugs in
+the existing AfPool NA1F poll path were found and fixed.
+
+### 20.1 Fix — `get_batch(timeout_s=0)` was a silent no-op
+
+`CudaIpcAfdTransport.get_batch` guarded its scan with
+`while time.time() < deadline:`. For `timeout_s == 0` that is immediately
+false, so it returned `[]` **without scanning**. But callers use `timeout_s=0`
+to mean "one non-blocking pass":
+
+- `AfFfnWorker._poll_ready(n, 0.0)` — used when the per-layer queue is non-empty;
+- `extra_gather(lambda: self._poll_ready(n, 0.0), ...)` — so **`extra_gather`
+  had always been a no-op in the pool path**.
+
+`get_batch` now always scans at least once, and takes `nonblocking=True` to mean
+exactly one pass regardless of the clock.
+
+### 20.2 Fix — per-link blocking starves later links (head-of-line)
+
+`_poll_ready` called `tr.get_batch(timeout_s=timeout_s)` **per link, in link
+order**. An idle link 0 blocks for the full timeout before link 1 is even
+looked at, so a hop already ready on link 1 waits behind it. Measured directly
+(fake links, one idle + one ready, `timeout_s=2ms`, 20 trials, p50):
+
+| poll path | latency to reach link1's ready hop |
+|---|---:|
+| legacy per-link blocking | **2.056 ms** |
+| drain-all (`SGLANG_AFD_FFN_POLL_DRAIN_ALL=1`, default) | **0.002 ms** |
+
+`_poll_ready` now drains every link non-blocking, then parks **once** and
+re-drains. Idle cost is O(1) in `num_attn` instead of O(num_attn).
+`SGLANG_AFD_FFN_POLL_DRAIN_ALL=0` restores the legacy scan for A/B.
+Regression tests: `test/registered/unit/afd/test_afd_ffn_poll.py` (6 tests).
+
+### 20.3 Measured: no throughput difference in the synthetic pool bench
+
+`bench_af_pool`, 2A1F vs 1A1F, 4 reps interleaved, `SKIP_EXTRA_GATHER=1` to
+isolate the HOL fix, tree frozen (unlike a first, rejected run):
+
+| regime | arm | 2A1F tok/s | 2A1F / 1A1F |
+|---|---|---:|---:|
+| attn-bound (`attn_us=1100`, `ffn_us=520`) | legacy | 12628 | 1.92x |
+| attn-bound | drain-all | **12883** | **1.96x** |
+| FFN-bound (`attn_us=200`, `ffn_us=400`, run 1) | legacy | 16362 | 1.07x |
+| FFN-bound | drain-all | ~22600 (noisy) | 1.22–1.98x |
+
+The attn-bound numbers are stable (wall 0.505–0.555 s across 8 runs) and show
+**+0.6% (within noise)**. So the HOL delay is real (20.2) but is **not on the
+critical path** in this bench: 2A1F already reaches ~1.95x, i.e. the FFN keeps
+up at 2x Attn supply. The FFN-bound run 1 was rejected — 0.1–0.3 s walls,
+one 30255 tok/s outlier, and the source tree was edited mid-run.
+
+### 20.4 The pool KPI was broken: `mean_ffn_util` was clamped round-trip time
+
+`bench_af_pool` reports `mean_ffn_util`, and `pool/README.md` said to read it.
+It was computed from `compute_s = time.perf_counter() - t0` spanning **post →
+wait**, i.e. the full *round trip*, accumulated per FFN rank and then
+`min(1.0, busy_s / wall_s)`. Those round trips overlap, so whenever the link
+saturates the sum exceeds wall time and it clamps — it read **1.000 for both
+1A1F and 2A1F**, i.e. it could not distinguish a half-idle FFN (real
+utilisation 0.503) from a saturated one (0.956). It only dips below 1.0 when
+the link is under-filled (1A2F read 0.513). It is therefore an aggregate
+round-trip occupancy, not a utilisation, and it cannot show the one quantity
+the 2A1F hypothesis is about.
+
+Fixed. `AfFfnWorker` now self-reports its own serve-loop occupancy
+(`busy_s / elapsed_s`, where `busy_s` includes the post-serve
+`torch.cuda.synchronize()` that `SGLANG_AFD_POOL_SERVE_SYNC` enables) to
+`SGLANG_AFD_POOL_UTIL_FILE`; the bench reads it before terminating the FFN
+children and reports it as `mean_ffn_util`. The old round-trip number is kept
+as `mean_ffn_rtt_frac` and documented as *not* utilisation.
+
+**This is the measurement §18.4 could only estimate.** Same config as §20.3
+(attn-bound, `attn_us=1100` / `ffn_us=520`), one run each:
+
+| arm | tok/s | 2A1F/1A1F | `mean_ffn_util` (new, FFN-side) | `mean_ffn_rtt_frac` (old) |
+|---|---:|---:|---:|---:|
+| 1A1F | 6589.1 | — | **0.503** | 1.000 |
+| 2A1F | 12882.7 | **1.96x** | **0.956** | 1.000 |
+
+FFN-side self-report (`ffn0_util.csv`, `busy_s,elapsed_s,frac,tasks`):
+
+```
+1A1F: 0.254387, 0.505262, 0.503477, 414
+2A1F: 0.481435, 0.503657, 0.955880, 808
+```
+
+So the second Attn worker **doubles the hops served (414 → 808) and takes FFN
+serve occupancy from 50.3% to 95.6%** — the "FFN was idle, more Attn supply
+fills it" story, now measured rather than inferred. Two consequences:
+
+1. **It also predicts the ceiling.** At 2A1F the FFN is at 95.6%, i.e. ~1.9x
+   the 1A1F load, so the FFN is the next bottleneck. A third Attn worker would
+   push demand past FFN capacity and add queueing, not throughput — consistent
+   with §20.5 and with the 2A4F regression (0.73x) seen in E2E.
+2. **It does not change §20.3's verdict.** The HOL fix still moves no
+   throughput, because with drain-all vs legacy the hop count and wall are the
+   same; utilisation is derived and therefore identical.
+
+### 20.5 Conclusion
+
+1. Both poll bugs were real and are fixed, with the HOL delay cut 1000x and a
+   previously-dead `extra_gather` revived. Keep the fix.
+2. **Neither fix moves throughput in the synthetic bench, in either regime.**
+   Per §17.3, 2A1F should still be judged against the 46.5 ms replica baseline,
+   not against 1A1F; the E2E 2A1F measurements remain 1.30x over 1A1F and 0.32x
+   of a 3-GPU replica.
+3. The synthetic bench **cannot create the asymmetry** the HOL fix addresses:
+   both Attn clients run the same lockstep workload, so link 0 is rarely idle
+   while link 1 is ready. Testing the fix properly needs independent request
+   streams (one Attn idle/light) — i.e. the E2E `bench_multi_attn.sh` path.
+4. **`mean_ffn_util` is now trustworthy** (20.4) and confirms the 2A1F
+   mechanism: FFN serve occupancy 50.3% → 95.6%. It also shows the FFN becomes
+   the bottleneck at 2A1F, so adding a 3rd Attn worker is not the next move.
+
+Reproduce §20.2: `python3 -m pytest test/registered/unit/afd/test_afd_ffn_poll.py -q`.
+Reproduce §20.3: `REPS=4 ATTN_US=1100 FFN_US=520 REQS=16 bash python/sglang/srt/afd/pool/bench_poll_ab.sh`
+(raw results in `/tmp/afd_poll_ab2/results.txt`).
+Reproduce §20.4: same bench with `--compare-1a1f`; read the `mean_ffn_util`
+column, or the raw self-report in `$ENDPOINT_DIR/ffn0_util.csv`.

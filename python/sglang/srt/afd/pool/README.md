@@ -34,6 +34,19 @@ python -m sglang.srt.afd.bench_af_pool \
 
 Read `tok_s` and `mean_ffn_util` — success is 1A2F beating 1A1F when FFN-bound.
 
+### Reading `mean_ffn_util`
+
+`mean_ffn_util` is the **FFN worker's own** serve-loop occupancy
+(`busy_s / elapsed_s`), self-reported via `SGLANG_AFD_POOL_UTIL_FILE`. That is
+the number to trust for "is the FFN actually busy".
+
+The `mean_ffn_rtt_frac` column is a *different*, non-utilisation quantity: the
+attn-side `post -> wait` round trip accumulated per FFN rank and clamped to
+1.0. Those round trips overlap, so it saturates whenever the link is full —
+it reads `1.000` for both 1A1F and 2A1F even though real FFN utilisation is
+0.503 vs 0.956, and only dips below 1.0 when the link is under-filled
+(1A2F: 0.513). **Do not read it as utilisation** (see `progress.md` §20.4).
+
 ## Layout
 
 | Module | Role |

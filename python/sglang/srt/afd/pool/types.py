@@ -87,12 +87,22 @@ class PoolStats:
         return float(self.tokens_completed) / w
 
     def ffn_busy_frac(self, ffn_rank: int) -> float:
+        """Attn-side *round-trip* occupancy of an FFN rank, clamped to 1.0.
+
+        NOT utilisation. ``ffn_busy_s`` accumulates ``post -> wait`` round
+        trips, which overlap across in-flight hops, so under any pipelining
+        the sum exceeds wall time and this saturates at 1.0 regardless of real
+        FFN headroom (progress.md §20.4). For a real number use the FFN
+        worker's own self-report: ``AfFfnWorker.utilization()`` /
+        ``SGLANG_AFD_POOL_UTIL_FILE``.
+        """
         w = self.wall_s
         if w <= 0 or ffn_rank >= len(self.ffn_busy_s):
             return 0.0
         return min(1.0, float(self.ffn_busy_s[ffn_rank]) / w)
 
     def mean_ffn_busy_frac(self) -> float:
+        """Mean of :meth:`ffn_busy_frac` — round-trip occupancy, not util."""
         if not self.ffn_busy_s:
             return 0.0
         w = self.wall_s

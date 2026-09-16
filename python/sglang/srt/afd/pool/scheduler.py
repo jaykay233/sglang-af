@@ -130,6 +130,6 @@ class AfScheduler:
         return (
             f"attn={self.attn_rank} submitted={s.tasks_submitted} "
             f"done={s.tasks_completed} tokens={s.tokens_completed} "
-            f"wall_s={s.wall_s:.3f} tok_s={s.tok_s:.1f} ffn_util=[{util}] "
+            f"wall_s={s.wall_s:.3f} tok_s={s.tok_s:.1f} ffn_rtt_frac=[{util}] "
             f"inflight={self.credit.snapshot()}"
         )

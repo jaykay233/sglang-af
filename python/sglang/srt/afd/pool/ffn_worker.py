@@ -66,6 +66,7 @@ class AfFfnWorker:
         self._skip_extra_gather = _env_flag(
             "SGLANG_AFD_FARM_SKIP_EXTRA_GATHER", default=False
         )
+        self._drain_all = bool(envs.SGLANG_AFD_FFN_POLL_DRAIN_ALL.get())
         self._ffn_queue = None
         if envs.SGLANG_AFD_FFN_QUEUE_ENABLE.get():
             from sglang.srt.afd.farm.lpu_sim import PerLayerBatchQueue
@@ -79,6 +80,10 @@ class AfFfnWorker:
         self._lpu_stats_every = max(
             0, int(os.environ.get("SGLANG_AFD_FARM_LPU_STATS_EVERY", "0") or 0)
         )
+        # FFN-side utilisation self-report (see utilization()). Off by default.
+        self._util_path = (envs.SGLANG_AFD_POOL_UTIL_FILE.get() or "").strip()
+        self._util_last = 0.0
+        self._serve_t0 = time.perf_counter()
 
         self._stop.clear()
         for i in range(topo.num_attn):
@@ -140,7 +145,36 @@ class AfFfnWorker:
             ep,
         )
 
-    def _poll_ready(self, n: int, timeout_s: float):
+    def _poll_once(self, n: int):
+        """One non-blocking scan of every Attn link.
+
+        Must never block on a single link: with Na Attn peers, blocking on an
+        idle link i delays a hop that is already ready on link j, which
+        serialises the pool and caps 2A1F below the sum of its parts.
+        """
+        items = []
+        for i in range(n):
+            if not self._link_ready[i].is_set():
+                continue
+            tr = self._transports[i]
+            if tr is None:
+                continue
+            try:
+                batches = tr.get_batch(timeout_s=0.0, nonblocking=True)
+            except Exception as e:
+                logger.exception(
+                    "AfPool FFN=%s attn=%s get_batch failed: %s",
+                    self.ffn_rank,
+                    i,
+                    e,
+                )
+                continue
+            for batch in batches:
+                items.append((tr, batch))
+        return items
+
+    def _poll_legacy(self, n: int, timeout_s: float):
+        """Pre-fix scan: blocking get_batch per link, in link order."""
         items = []
         for i in range(n):
             if not self._link_ready[i].is_set():
@@ -162,6 +196,64 @@ class AfFfnWorker:
                 items.append((tr, batch))
         return items
 
+    def _poll_ready(self, n: int, timeout_s: float):
+        """Drain all links, then park once and drain again if nothing was ready.
+
+        The park is a single shared wait rather than one per link, so idle cost
+        is O(1) in num_attn instead of O(num_attn) and no link can starve
+        another.
+        """
+        if not self._drain_all:
+            return self._poll_legacy(n, timeout_s)
+        items = self._poll_once(n)
+        if items or timeout_s <= 0:
+            return items
+        deadline = time.perf_counter() + timeout_s
+        while not items and time.perf_counter() < deadline:
+            self._park_idle()
+            items = self._poll_once(n)
+        return items
+
+    def _park_idle(self) -> None:
+        # Park on one link so an enabled eventfd still wakes us (off by
+        # default); otherwise this is a GIL-yielding yield, matching the
+        # transport's own idle path. Cost is O(1) in num_attn either way.
+        tr = self._transports[0] if self._transports else None
+        if tr is not None:
+            try:
+                tr.park_idle()
+                return
+            except Exception:
+                pass
+        time.sleep(0)
+
+    def utilization(self):
+        """FFN-side serve utilisation: ``(busy_s, elapsed_s, frac, tasks)``.
+
+        The honest numerator. ``busy_s`` accumulates serve-loop wall time,
+        which includes the post-serve ``torch.cuda.synchronize()`` when
+        ``SGLANG_AFD_POOL_SERVE_SYNC`` is on, so it measures time actually
+        spent serving hops. Contrast the attn-side round trip, which sums
+        overlapping in-flight hops and is clamped to 1.0 — under any
+        pipelining it reads 1.000 regardless of real headroom.
+        """
+        with self._stats_lock:
+            busy = float(self.busy_s)
+            tasks = int(self.tasks_done)
+        elapsed = max(0.0, time.perf_counter() - self._serve_t0)
+        frac = min(1.0, busy / elapsed) if elapsed > 0 else 0.0
+        return busy, elapsed, frac, tasks
+
+    def _publish_util(self) -> None:
+        if not self._util_path:
+            return
+        busy, elapsed, frac, tasks = self.utilization()
+        try:
+            with open(self._util_path, "w", encoding="utf-8") as f:
+                f.write(f"{busy:.6f},{elapsed:.6f},{frac:.6f},{tasks}\n")
+        except Exception:
+            pass
+
     def _serve_loop(self) -> None:
         if torch.cuda.is_available() and str(self.device).startswith("cuda"):
             try:
@@ -171,6 +263,7 @@ class AfFfnWorker:
         from sglang.srt.afd.farm.lpu_sim import dispatch_lpu_batches, extra_gather
 
         n = self.topo.num_attn
+        self._serve_t0 = time.perf_counter()
         while not self._stop.is_set():
             if self._ffn_queue is not None:
                 # Never age a ready layer behind an empty polling timeout. If
@@ -228,6 +321,11 @@ class AfFfnWorker:
             with self._stats_lock:
                 self.tasks_done += max(1, served if served else len(collected))
                 self.busy_s += dt
+            if self._util_path:
+                _now = time.perf_counter()
+                if _now - self._util_last >= 0.25:
+                    self._util_last = _now
+                    self._publish_util()
             if (
                 self._lpu_stats_every > 0
                 and self._lpu_stats_calls % self._lpu_stats_every == 0

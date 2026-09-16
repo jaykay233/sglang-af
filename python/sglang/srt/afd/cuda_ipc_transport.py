@@ -1023,7 +1023,17 @@ class CudaIpcAfdTransport(AfdTransport):
         mb_id, _f2a_bufs = pending
         return self._mailbox.get_done(mb_id) == handle.id
 
-    def get_batch(self, timeout_s: float = 1.0) -> List[AfdServerBatch]:
+    def park_idle(self, timeout_s: float = 0.00005) -> None:
+        """Public: yield/park the calling thread waiting for a peer post.
+
+        Used by the NA1F FFN serve loop, which parks once for all links instead
+        of blocking on a single link (see ``AfFfnWorker._poll_ready``).
+        """
+        self._park_until_wake(timeout_s)
+
+    def get_batch(
+        self, timeout_s: float = 1.0, *, nonblocking: bool = False
+    ) -> List[AfdServerBatch]:
         if self._role != AfdMode.FFN:
             return []
         if not self._ready.wait(timeout=timeout_s):
@@ -1093,7 +1103,7 @@ class CudaIpcAfdTransport(AfdTransport):
         spins = 0
         # Hot window: after recent work, pure-busy ~3ms so post→seen skips sleep(0).
         hot_until = time.perf_counter() + (0.003 if self._ffn_hot else 0.0)
-        while time.time() < deadline:
+        while True:
             ready: List[AfdServerBatch] = []
             for mb in range(self._num_mb):
                 posted = self._mailbox.get_posted(mb)
@@ -1120,6 +1130,14 @@ class CudaIpcAfdTransport(AfdTransport):
                         time.sleep(0)
                 self._ffn_hot = True
                 return ready
+            # Scan first, then decide whether to wait. Always scan at least
+            # once: the old `while time.time() < deadline` guard skipped the
+            # scan entirely for timeout_s == 0 and returned [], but callers use
+            # timeout_s=0 to mean "one non-blocking pass" — the NA1F FFN worker
+            # draining several Attn links, and extra_gather. That silently made
+            # both no-ops. Never park on a pass that must not block.
+            if nonblocking or time.time() >= deadline:
+                return []
             spins += 1
             now = time.perf_counter()
             if now < hot_until:
@@ -1130,7 +1148,6 @@ class CudaIpcAfdTransport(AfdTransport):
             # Micro-busy after wake/timeout to catch a post that raced the park.
             hot_until = time.perf_counter() + 0.0002
             spins = 0
-        return []
 
     def respond(
         self, batch: AfdServerBatch, tensors: Sequence[torch.Tensor]

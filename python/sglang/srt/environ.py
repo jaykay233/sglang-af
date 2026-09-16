@@ -388,6 +388,15 @@ class Envs:
     SGLANG_AFD_FFN_GATHER_US = EnvInt(0)
     # FFN: max mb slots to gather into one compute when gather_us > 0.
     SGLANG_AFD_FFN_GATHER_MAX = EnvInt(4)
+    # FFN: with Na Attn peers, drain every link with a non-blocking scan before
+    # parking. Blocking per link serialises the pool: an idle link i delays a
+    # hop already ready on link j. Set 0 to restore the legacy per-link scan.
+    SGLANG_AFD_FFN_POLL_DRAIN_ALL = EnvBool(True)
+    # FFN: if set, the serve loop periodically writes its *own* utilisation as
+    # "busy_s,elapsed_s,frac,tasks". This is the honest FFN metric: the
+    # attn-side round trip double-counts overlapped in-flight hops and clamps
+    # to 1.0, so it cannot show FFN headroom (see progress.md §20.4).
+    SGLANG_AFD_POOL_UTIL_FILE = EnvStr("")
     # FFN per-layer bounded queue. This gathers ready A2F hops before compute,
     # independent of the short transport-level gather above.
     SGLANG_AFD_FFN_QUEUE_ENABLE = EnvBool(False)

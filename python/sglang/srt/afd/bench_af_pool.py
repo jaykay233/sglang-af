@@ -58,6 +58,7 @@ def _child_env(
     max_inflight: int,
     num_mb: int,
     max_token: int,
+    util_path: str = "",
 ) -> dict:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
@@ -74,6 +75,8 @@ def _child_env(
     env["SGLANG_AFD_EVENTFD_WAKE"] = "0"
     env["SGLANG_AFD_TRUE_OVERLAP"] = "0"
     env["SGLANG_AFD_LAYER_PIPELINE"] = "0"
+    if util_path:
+        env["SGLANG_AFD_POOL_UTIL_FILE"] = util_path
     return env
 
 
@@ -208,6 +211,7 @@ def _launch_matrix(
         )
     if os.path.isdir(endpoint_dir):
         shutil.rmtree(endpoint_dir, ignore_errors=True)
+    os.makedirs(endpoint_dir, exist_ok=True)
     apply_pool_env(
         num_attn=num_attn,
         num_ffn=num_ffn,
@@ -234,6 +238,7 @@ def _launch_matrix(
             max_inflight=max_inflight,
             num_mb=num_mb,
             max_token=max_token,
+            util_path=os.path.join(endpoint_dir, f"ffn{j}_util.csv"),
         )
         cmd = [
             py,
@@ -310,6 +315,22 @@ def _launch_matrix(
         r = p.wait()
         if r != 0:
             rc = r
+    # FFN-side self-reported utilisation (the honest metric). Must be read
+    # before the FFN procs are terminated. The attn-side value is kept only as
+    # "rtt_frac": it is the post->wait round trip, sums overlapping in-flight
+    # hops and is clamped to 1.0, so it always reads 1.000 under load.
+    ffn_utils = []
+    for j in range(num_ffn):
+        upath = os.path.join(endpoint_dir, f"ffn{j}_util.csv")
+        if not os.path.isfile(upath):
+            continue
+        try:
+            parts = open(upath, encoding="utf-8").read().strip().split(",")
+            if len(parts) >= 3:
+                ffn_utils.append(float(parts[2]))
+        except Exception:
+            pass
+
     for p in procs:
         if p.poll() is None:
             p.terminate()
@@ -333,13 +354,15 @@ def _launch_matrix(
     # Aggregate: max wall across Attn (barrier-ish), sum tok/s approx.
     wall = max(walls) if walls else float("nan")
     tok_s = sum(toks) if toks else float("nan")
-    util = statistics.mean(utils) if utils else float("nan")
+    rtt_frac = statistics.mean(utils) if utils else float("nan")
+    ffn_util = statistics.mean(ffn_utils) if ffn_utils else float("nan")
     return {
         "num_attn": num_attn,
         "num_ffn": num_ffn,
         "wall_s": wall,
         "tok_s": tok_s,
-        "mean_ffn_util": util,
+        "mean_ffn_util": ffn_util,
+        "mean_ffn_rtt_frac": rtt_frac,
         "rc": rc,
     }
 
@@ -449,7 +472,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         results.append(r)
         print(
             f"RESULT {na}A{nf}F wall_s={r['wall_s']:.4f} tok_s={r['tok_s']:.1f} "
-            f"mean_ffn_util={r['mean_ffn_util']:.3f} rc={r['rc']}",
+            f"mean_ffn_util={r['mean_ffn_util']:.3f} "
+            f"mean_ffn_rtt_frac={r['mean_ffn_rtt_frac']:.3f} rc={r['rc']}",
             flush=True,
         )
 
