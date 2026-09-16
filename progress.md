@@ -1421,14 +1421,15 @@ fills it" story, now measured rather than inferred. Two consequences:
 
 1. Both poll bugs were real and are fixed, with the HOL delay cut 1000x and a
    previously-dead `extra_gather` revived. Keep the fix.
-2. **Neither fix moves throughput in the synthetic bench, in either regime.**
-   Per §17.3, 2A1F should still be judged against the 46.5 ms replica baseline,
-   not against 1A1F; the E2E 2A1F measurements remain 1.30x over 1A1F and 0.32x
-   of a 3-GPU replica.
+2. **In the synthetic bench neither fix moves throughput** (12628 → 12883
+   tok/s, within noise) because that bench cannot create the asymmetry — see
+   item 3. **§21 then shows the fix is worth 1.33–1.42x tok/s end-to-end once
+   the asymmetry is real.** Per §17.3, 2A1F should still be judged against the
+   46.5 ms replica baseline, not against 1A1F.
 3. The synthetic bench **cannot create the asymmetry** the HOL fix addresses:
    both Attn clients run the same lockstep workload, so link 0 is rarely idle
    while link 1 is ready. Testing the fix properly needs independent request
-   streams (one Attn idle/light) — i.e. the E2E `bench_multi_attn.sh` path.
+   streams (one Attn idle/light) — done in §21.
 4. **`mean_ffn_util` is now trustworthy** (20.4) and confirms the 2A1F
    mechanism: FFN serve occupancy 50.3% → 95.6%. It also shows the FFN becomes
    the bottleneck at 2A1F, so adding a 3rd Attn worker is not the next move.
@@ -1438,3 +1439,87 @@ Reproduce §20.3: `REPS=4 ATTN_US=1100 FFN_US=520 REQS=16 bash python/sglang/srt
 (raw results in `/tmp/afd_poll_ab2/results.txt`).
 Reproduce §20.4: same bench with `--compare-1a1f`; read the `mean_ffn_util`
 column, or the raw self-report in `$ENDPOINT_DIR/ffn0_util.csv`.
+
+## 21. The head-of-line fix *does* pay — under asymmetric load (2A1F E2E)
+
+§20.3 could not show a throughput effect because `bench_af_pool` drives both
+Attn clients with the same lockstep workload, so FFN link0 is rarely idle while
+link1 holds a ready hop. The HOL condition never arises. This section creates it
+deliberately, end-to-end with the real model.
+
+### 21.1 Setup
+
+Attn self-prefill (PD=null), DeepSeek-V2-Lite-Chat, **2A1F**:
+Attn0 → GPU5, Attn1 → GPU6, FFN → GPU7, `mem-fraction-static 0.82`,
+`in=1 / out=64 / conc=8 / 32 prompts`, breakable decode CG.
+
+**All requests are sent straight to Attn1**; Attn0 is brought up and connected
+but receives no traffic, so the FFN's link0 is permanently idle while link1 is
+busy. Only `SGLANG_AFD_FFN_POLL_DRAIN_ALL` differs between arms. Two reps, with
+the arm order reversed in rep2 to cancel drift. Reproduce with
+`ARM=drainall|legacy bash python/sglang/srt/afd/pool/bench_asym_ab.sh`.
+
+### 21.2 Result
+
+| metric | rep | drain-all | legacy | legacy/drain-all |
+|---|---|---:|---:|---:|
+| output tok/s | 1 | **50.2** | 37.7 | 0.751x |
+| output tok/s | 2 | **57.1** | 40.1 | 0.703x |
+| median TPOT ms | 1 | **115.4** | 162.8 | 1.411x |
+| median TPOT ms | 2 | **108.4** | 158.1 | 1.459x |
+| FFN util | 1 | 0.392 | 0.300 | 0.767x |
+| FFN util | 2 | 0.337 | 0.282 | 0.836x |
+| hops served | 1 | 6963 | 7006 | — |
+| hops served | 2 | 6982 | 6983 | — |
+| completed | both | 32 | 32 | — |
+
+**drain-all is 1.33–1.42x tok/s faster and 29–31% lower TPOT** (median TPOT
+115–108 ms vs 158–163 ms), with no errors in either arm.
+
+### 21.3 The mechanism is confirmed by the FFN's own counter
+
+This is the part that makes it conclusive rather than a timing coincidence:
+
+- **Hops served are identical** — 6963 vs 7006 (rep1), 6982 vs 6983 (rep2).
+  Legacy did not do less work, and did not drop requests (32/32 both arms).
+- **Yet legacy's FFN utilisation is *lower*** — 0.300 vs 0.392, and 0.282 vs
+  0.337. Same work in the same wall window, but the FFN spent more of it *not
+  serving*.
+
+That is exactly the HOL signature: `_poll_ready` blocks on the idle link0 for
+the full poll timeout before it ever looks at link1, so each serve iteration
+absorbed dead time while a hop sat ready on link1. The §20.4 utilisation
+self-report is what makes this visible; the old attn-side round-trip number
+clamped at 1.000 for both arms and would have hidden it.
+
+### 21.4 Why §20.3 saw nothing, and what that means
+
+Both statements are true, and they are consistent:
+
+| regime | link0 vs link1 | HOL delay | effect of fix |
+|---|---|---|---|
+| synthetic §20.3 | both equally busy (lockstep) | rare | none (within noise) |
+| asymmetric §21.2 | link0 idle, link1 busy | every poll | **1.33–1.42x** |
+
+So the fix is not a micro-optimisation — it removes a serialisation that is
+*invisible when the two Attn workers happen to be balanced and severe when they
+are not*. Balanced load is the special case: any real deployment behind a
+round-robin router, a mini-LB, or with unequal prefill/decode mixes will have
+one Attn worker ahead of the other most of the time, which is precisely the
+regime measured here.
+
+This also reframes the 2A1F E2E numbers on record. `bench_multi_attn.sh` uses
+`round_robin`, i.e. approximately the balanced case, so its historical 1.30x
+over 1A1F was measured in the regime where this bug costs least. The 2A1F
+ceiling under imbalance was previously suppressed by the poll path itself.
+
+### 21.5 Conclusion
+
+1. Keep the fix; it is now justified by an end-to-end measurement (1.33–1.42x
+   tok/s, 29–31% lower TPOT) rather than by mechanism alone.
+2. `SGLANG_AFD_FFN_POLL_DRAIN_ALL=1` should stay the default, which it is.
+3. Any future NA1F comparison must state the load balance between Attn workers,
+   because it is now a first-order variable. A `round_robin`-only benchmark
+   cannot detect this class of bug.
+4. The §20.4 utilisation KPI is what made the mechanism provable (same hops,
+   lower busy fraction). Keep it.
