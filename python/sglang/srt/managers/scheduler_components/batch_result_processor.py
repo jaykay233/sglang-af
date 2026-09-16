@@ -58,6 +58,46 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _farm_ready_row_map(
+    batch: ScheduleBatch, ready_req_pool_indices: torch.Tensor
+) -> dict:
+    """Map ready ``req_pool_idx`` values onto this batch's row indices.
+
+    The farm returns results keyed by the stable ``req_pool_idx``; result
+    processing is row oriented, so the two must be reconciled explicitly.
+    """
+    ready = ready_req_pool_indices.to("cpu").tolist()
+    total = batch.req_pool_indices
+    if isinstance(total, torch.Tensor):
+        rows = total.to("cpu").tolist()
+    else:  # pragma: no cover - req_pool_indices is always a tensor in practice
+        rows = list(total)
+    pos = {int(v): k for k, v in enumerate(ready)}
+    mapping = {}
+    for row, value in enumerate(rows):
+        key = pos.get(int(value))
+        if key is not None:
+            mapping[row] = key
+    if len(mapping) != len(ready):
+        raise RuntimeError(
+            "AFD farm ready rows are not a subset of the batch req_pool_indices: "
+            f"ready={ready} batch_rows={rows}"
+        )
+    return mapping
+
+
+def _farm_ready_mask(
+    batch: ScheduleBatch, ready_req_pool_indices: torch.Tensor
+) -> torch.Tensor:
+    """Boolean per-row mask (batch order) of rows sampled this forward."""
+    mapping = _farm_ready_row_map(batch, ready_req_pool_indices)
+    n_rows = len(batch.reqs)
+    mask = torch.zeros(n_rows, dtype=torch.bool)
+    for row in mapping:
+        mask[row] = True
+    return mask
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
@@ -646,6 +686,18 @@ class SchedulerBatchResultProcessor:
             result.can_run_cuda_graph,
         )
 
+        # AFD farm persistent runtime: a forward may legitimately sample zero
+        # tokens. Every row is then still in flight, so there is nothing to
+        # normalize or commit; leave the Reqs untouched and let a later forward
+        # finish them. ``prepare_for_decode`` consults the live farm runtime
+        # directly, so the deferral does not depend on state carried here.
+        if result.ready_req_pool_indices is not None and next_token_ids is None:
+            if int(result.ready_req_pool_indices.numel()) != 0:
+                raise RuntimeError(
+                    "AFD farm returned no tokens for a non-empty ready set"
+                )
+            return
+
         next_token_ids, next_token_logprobs = self._normalize_decode_outputs(
             batch=batch,
             result=result,
@@ -653,7 +705,27 @@ class SchedulerBatchResultProcessor:
             next_token_ids=next_token_ids,
         )
 
-        self.metrics_reporter.num_generated_tokens += len(batch.reqs)
+        # AFD farm partial-ready: ``result`` carries only the rows that were
+        # sampled this forward. Map each ready row to its index in this batch
+        # and remember the mask so the next ``prepare_for_decode`` only advances
+        # those rows.
+        ready_row_map = None
+        if result.ready_req_pool_indices is not None:
+            ready_row_map = _farm_ready_row_map(batch, result.ready_req_pool_indices)
+            # Keyed by req_pool_idx, not row: the running batch may be merged or
+            # filtered between this result and the next prepare_for_decode.
+            batch.afd_farm_deferred_req_pool_indices = (
+                None
+                if result.deferred_req_pool_indices is None
+                else result.deferred_req_pool_indices.to("cpu").tolist()
+            )
+        else:
+            if hasattr(batch, "afd_farm_deferred_req_pool_indices"):
+                batch.afd_farm_deferred_req_pool_indices = None
+
+        self.metrics_reporter.num_generated_tokens += (
+            len(batch.reqs) if ready_row_map is None else len(ready_row_map)
+        )
         if not batch.spec_algorithm.is_none():
             self.metrics_reporter.update_spec_metrics(
                 batch.batch_size(), result.num_correct_drafts
@@ -668,6 +740,11 @@ class SchedulerBatchResultProcessor:
         for i, req in enumerate(batch.reqs):
             req: Req
 
+            if ready_row_map is not None and i not in ready_row_map:
+                # Deferred row: the farm still owns its in-flight token.
+                continue
+            out_i = i if ready_row_map is None else ready_row_map[i]
+
             if (self.enable_overlap or self.enable_overlap_mlx) and (
                 req.finished() or req.is_retracted
             ):
@@ -677,7 +754,7 @@ class SchedulerBatchResultProcessor:
 
             # next_token_id is a per-req list: 1 token for non-spec, the verified
             # run for spec (already grammar-truncated in _resolve_spec_v2_tokens).
-            next_token_id = next_token_ids[i]
+            next_token_id = next_token_ids[out_i]
             is_spec = not batch.spec_algorithm.is_none()
 
             req.output_ids.extend(next_token_id)
@@ -687,12 +764,14 @@ class SchedulerBatchResultProcessor:
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accept_len)
 
-            self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
+            self._handle_finish_state_updated_req(
+                req, batch, result, out_i, logits_output
+            )
 
             if req.return_logprob:
                 self._apply_decode_logprobs(
                     req=req,
-                    i=i,
+                    i=out_i,
                     batch=batch,
                     next_token_id=next_token_id,
                     next_token_logprobs=next_token_logprobs,
@@ -704,7 +783,7 @@ class SchedulerBatchResultProcessor:
                 # token; stride = speculative_num_draft_tokens for spec, 1 for non-spec.
                 stride = result.speculative_num_draft_tokens or 1
                 accept_len = len(next_token_id)
-                start = i * stride
+                start = out_i * stride
                 req.hidden_states.extend(
                     logits_output.hidden_states[start : start + accept_len]
                     .cpu()

@@ -649,6 +649,8 @@ class Scheduler(
             logger.warning("load snapshot writer init failed: %s", e)
 
     def init_idle_sleeper(self) -> None:
+        # Throttle clock for SGLANG_IDLE_HOUSEKEEPING_INTERVAL_MS (progress.md §15).
+        self._last_idle_housekeeping = 0.0
         if (
             self.ps.pp_rank == 0
             and self.ps.attn_tp_rank == 0
@@ -1007,10 +1009,37 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        self.is_mixed_chunk = (
-            self.chunked_prefill_size is not None
-            and self.server_args.enable_mixed_chunk
+        self.enable_decode_token_budget = bool(
+            self.server_args.enable_decode_token_budget
         )
+        self.decode_token_budget_stall_limit = int(
+            self.server_args.decode_token_budget_stall_limit
+        )
+        self.decode_stall_steps = 0
+        # Decode token budget implies mixed chunk so each prefill step reserves
+        # running_bs decode tokens and folds decode into the same forward.
+        if self.enable_decode_token_budget:
+            if self.chunked_prefill_size is None:
+                logger.warning(
+                    "enable_decode_token_budget requires chunked prefill; disabling."
+                )
+                self.enable_decode_token_budget = False
+                self.is_mixed_chunk = (
+                    self.chunked_prefill_size is not None
+                    and self.server_args.enable_mixed_chunk
+                )
+            else:
+                self.is_mixed_chunk = True
+                logger.info(
+                    "Decode token budget scheduling enabled "
+                    f"(stall_limit={self.decode_token_budget_stall_limit}, "
+                    f"chunked_prefill_size={self.chunked_prefill_size})."
+                )
+        else:
+            self.is_mixed_chunk = (
+                self.chunked_prefill_size is not None
+                and self.server_args.enable_mixed_chunk
+            )
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
@@ -1636,6 +1665,10 @@ class Scheduler(
             and len(self.result_queue) > 0
         )
 
+        # AFD farm persistent runtime: the farm's deferral is read from its live
+        # runtime in ``prepare_for_decode``, not handled here — the model
+        # forward's host code runs inline (only GPU work is async), so the
+        # runtime is already settled when the next batch is prepared.
         return disable_overlap_for_batch or need_grammar_sync
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
@@ -2682,7 +2715,21 @@ class Scheduler(
             if self.running_batch.is_empty():
                 self.running_batch.batch_is_full = False
 
-        if self.dllm_config is not None:
+        # Sarathi-style anti-starvation: if decode has been skipped for too many
+        # consecutive steps, force a decode-only step before admitting more prefill.
+        force_decode_only = False
+        if (
+            self.enable_decode_token_budget
+            and self.decode_token_budget_stall_limit > 0
+            and not self.running_batch.is_empty()
+            and not self.running_batch.is_prefill_only
+            and self.decode_stall_steps >= self.decode_token_budget_stall_limit
+        ):
+            force_decode_only = True
+
+        if force_decode_only:
+            new_batch = None
+        elif self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
         else:
             new_batch = self.get_new_batch_prefill()
@@ -2701,7 +2748,20 @@ class Scheduler(
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
-            # Run prefill first if possible
+            # Run prefill first if possible (may be MIXED when decode token budget /
+            # mixed chunk is on, which schedules decode in the same step).
+            if self.enable_decode_token_budget:
+                if (
+                    getattr(new_batch, "decoding_reqs", None)
+                    or new_batch.forward_mode.is_mixed()
+                ):
+                    self.decode_stall_steps = 0
+                elif (
+                    not self.running_batch.is_empty()
+                    and not self.running_batch.is_prefill_only
+                ):
+                    # Prefill ran without mixing decode; count toward stall.
+                    self.decode_stall_steps += 1
             ret = new_batch
         else:
             # Run decode (skip for prefill-only batches)
@@ -2709,6 +2769,8 @@ class Scheduler(
                 not self.running_batch.is_empty()
                 and not self.running_batch.is_prefill_only
             ):
+                if self.enable_decode_token_budget:
+                    self.decode_stall_steps = 0
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
@@ -3385,11 +3447,49 @@ class Scheduler(
             return
         if batch_result.next_draft_input is not None:
             payload = RelayPayload.from_draft_input(batch_result.next_draft_input)
+        elif batch_result.ready_req_pool_indices is not None:
+            # AFD farm partial-ready: next_token_ids only covers the ready
+            # subset. The relay buffer is keyed by req_pool_idx and must get a
+            # valid (>= 0) entry for every row, so expand back to full width;
+            # deferred rows get a placeholder that the farm never reads.
+            payload = RelayPayload(
+                bonus_tokens=self._expand_farm_ready_tokens(
+                    future_indices, batch_result
+                )
+            )
         elif batch_result.has_sampled_token_ids:
             payload = RelayPayload(bonus_tokens=batch_result.next_token_ids)
         else:
             return
         self.future_map.stash(future_indices, payload)
+
+    @staticmethod
+    def _expand_farm_ready_tokens(
+        future_indices: torch.Tensor, batch_result: GenerationBatchResult
+    ) -> torch.Tensor:
+        """Scatter ready-only tokens into a full-width per-row buffer."""
+        n_rows = int(future_indices.shape[0])
+        device = future_indices.device
+        ready = batch_result.ready_req_pool_indices
+        tokens = batch_result.next_token_ids
+        full = torch.zeros(n_rows, dtype=torch.long, device=device)
+        if ready is None or tokens is None or int(ready.numel()) == 0:
+            return full
+        ready_dev = ready.to(device=device, dtype=torch.long).view(-1)
+        # ``nonzero`` on the outer-product mask yields (ready_ordinal, row)
+        # *pairs*, so it is compared by pair count, not element count.
+        rows = (future_indices.view(1, -1) == ready_dev.view(-1, 1)).nonzero(
+            as_tuple=False
+        )
+        if rows.shape[0] != ready_dev.numel():
+            raise RuntimeError(
+                "AFD farm ready rows are not a subset of the forward batch: "
+                f"ready={ready_dev.tolist()} batch={future_indices.tolist()}"
+            )
+        full[rows[:, 1]] = tokens.to(device=device, dtype=torch.long).view(-1)[
+            rows[:, 0]
+        ]
+        return full
 
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult
@@ -3507,6 +3607,19 @@ class Scheduler(
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         if not self.is_fully_idle():
             return
+
+        # Everything below is pure Python holding the GIL. A process that never
+        # serves real requests (notably an AFD FFN compute worker) reaches this
+        # path on every loop iteration, so the worker thread's MoE dispatch is
+        # starved (progress.md §15). When an interval is configured, run the
+        # housekeeping at most that often and otherwise just sleep.
+        interval_ms = envs.SGLANG_IDLE_HOUSEKEEPING_INTERVAL_MS.get()
+        if interval_ms > 0:
+            now = time.monotonic()
+            if now - self._last_idle_housekeeping < interval_ms / 1000.0:
+                self.maybe_sleep_on_idle()
+                return
+            self._last_idle_housekeeping = now
 
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).

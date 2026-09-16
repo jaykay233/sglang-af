@@ -243,14 +243,22 @@ class ComposedPipelineBase(ABC):
             role_to_pipeline_modules.get(role, {}).get(self.pipeline_name, set())
         )
 
-        if role == RoleType.DENOISER and task_name == "ti2v":
+        if role == RoleType.DENOISER:
+            # LTX-2 two-stage upsample/refinement need VAE latent stats on the
+            # denoiser hop (not only at the final decoder).
             if self.pipeline_name in {
-                "WanImageToVideoPipeline",
-                "WanImageToVideoDmdPipeline",
+                "LTX2TwoStagePipeline",
+                "LTX2TwoStageHQPipeline",
             }:
-                extra_allowed_modules.add("vae")
-            elif self.pipeline_name == "LTX2Pipeline":
                 extra_allowed_modules.update({"vae", "audio_vae"})
+            elif task_name == "ti2v":
+                if self.pipeline_name in {
+                    "WanImageToVideoPipeline",
+                    "WanImageToVideoDmdPipeline",
+                }:
+                    extra_allowed_modules.add("vae")
+                elif self.pipeline_name == "LTX2Pipeline":
+                    extra_allowed_modules.update({"vae", "audio_vae"})
 
         return extra_allowed_modules
 

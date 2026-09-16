@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineSta
 from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     LTX2ImageEncodingStage,
 )
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2 import (
     LTX2AVDecodingStage,
     LTX2AVDenoisingStage,
@@ -896,6 +897,7 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
                 (
                     LTX2ImageEncodingStage(
                         vae=self.get_module("vae"),
+                        role_affinity=RoleType.DENOISER,
                     ),
                     "ltx2_image_encoding_stage2",
                 ),

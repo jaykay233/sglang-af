@@ -504,6 +504,7 @@ class SchedulerDisaggMixin:
             pool_size=self._transfer_manager.pool_size,
             work_endpoint=sa.pool_work_endpoint,
             preallocated_slots=preallocated_slot_info,
+            ipc_handle=getattr(self._transfer_manager._engine, "ipc_handle_b64", None),
         )
         self._pool_result_push.send_multipart(encode_transfer_msg(register_msg))
         logger.info(
@@ -565,13 +566,27 @@ class SchedulerDisaggMixin:
             item = self._rdma_push_queue.get()
             if item is None:
                 break  # Shutdown signal
-            request_id, dest_session_id, dest_addr, transfer_size = item
+            dest_ipc_handle = None
+            dest_pool_ptr = 0
+            if len(item) >= 6:
+                (
+                    request_id,
+                    dest_session_id,
+                    dest_addr,
+                    transfer_size,
+                    dest_ipc_handle,
+                    dest_pool_ptr,
+                ) = item[:6]
+            else:
+                request_id, dest_session_id, dest_addr, transfer_size = item[:4]
             try:
                 success = self._transfer_manager.push_to_peer(
                     request_id=request_id,
                     dest_session_id=dest_session_id,
                     dest_addr=dest_addr,
                     transfer_size=transfer_size,
+                    dest_ipc_handle=dest_ipc_handle,
+                    dest_pool_ptr=dest_pool_ptr,
                 )
                 if success:
                     self._transfer_manager.free_staged(request_id)
@@ -684,38 +699,25 @@ class SchedulerDisaggMixin:
     # ------------------------------------------------------------------
 
     def _broadcast_to_all_ranks(self: Scheduler, data):
-        """Broadcast *data* from rank 0 to all other ranks.
+        """Broadcast *data* from world rank 0 to all other ranks.
 
         Rank 0 passes the real payload; non-rank-0 passes ``None``.
-        Broadcasts through all applicable groups (SP, CFG, TP).
+        Uses the world CPU group so CFG×TP layouts cannot desync the control
+        plane (cascading CFG then TP would make non-world CFG leaders send
+        ``None`` into their peer group).
         """
-        sa = self.server_args
+        if not self._is_multi_rank():
+            return data
 
-        if sa.sp_degree != 1:
-            data = broadcast_pyobj(
-                data,
-                self.worker.sp_group.rank,
-                self.worker.sp_cpu_group,
-                src=self.worker.sp_group.ranks[0],
-            )
+        from sglang.multimodal_gen.runtime.distributed import get_world_group
 
-        if sa.enable_cfg_parallel:
-            data = broadcast_pyobj(
-                data,
-                self.worker.cfg_group.rank,
-                self.worker.cfg_cpu_group,
-                src=self.worker.cfg_group.ranks[0],
-            )
-
-        if sa.tp_size > 1:
-            data = broadcast_pyobj(
-                data,
-                self.worker.tp_group.rank,
-                self.worker.tp_cpu_group,
-                src=self.worker.tp_group.ranks[0],
-            )
-
-        return data
+        world = get_world_group()
+        return broadcast_pyobj(
+            data,
+            world.rank,
+            world.cpu_group,
+            src=world.ranks[0],
+        )
 
     def _is_multi_rank(self: Scheduler) -> bool:
         sa = self.server_args
@@ -724,23 +726,20 @@ class SchedulerDisaggMixin:
     def _broadcast_tensor_dict_to_all_ranks(
         self: Scheduler, tensor_dict: dict | None
     ) -> dict | None:
-        """Broadcast a tensor dict from rank 0 to non-rank-0 via NCCL.
+        """Broadcast a tensor dict from world rank 0 to all ranks via NCCL.
 
-        Uses ``GroupCoordinator.broadcast_tensor_dict`` which ships tensor
-        metadata over the CPU group and the tensor payload over the device
-        (NCCL) group, so large GPU buffers never bounce through CPU.
+        Uses the world process group directly. Cascading CFG then TP groups is
+        incorrect for CFG×TP: non-world-0 CFG-group leaders would be asked to
+        send ``None`` (and TP subgroups whose ``ranks[0] != 0`` also exposed a
+        local/global src bug in ``broadcast_tensor_dict``).
         """
-        sa = self.server_args
+        if not self._is_multi_rank():
+            return tensor_dict
 
-        if sa.sp_degree != 1:
-            tensor_dict = self.worker.sp_group.broadcast_tensor_dict(tensor_dict, src=0)
-        if sa.enable_cfg_parallel:
-            tensor_dict = self.worker.cfg_group.broadcast_tensor_dict(
-                tensor_dict, src=0
-            )
-        if sa.tp_size > 1:
-            tensor_dict = self.worker.tp_group.broadcast_tensor_dict(tensor_dict, src=0)
-        return tensor_dict
+        from sglang.multimodal_gen.runtime.distributed import get_world_group
+
+        # Non-src ranks must pass None; world local src is always 0.
+        return get_world_group().broadcast_tensor_dict(tensor_dict, src=0)
 
     def _broadcast_req_to_all_ranks(self: Scheduler, req: Req | None) -> Req | None:
         """Broadcast a fully-loaded Req (scalars + GPU tensors) from rank 0.
@@ -1146,6 +1145,7 @@ class SchedulerDisaggMixin:
             pool_ptr=self._transfer_manager.pool_data_ptr,
             slot_offset=pending.slot.offset,
             slot_size=pending.slot.size,
+            ipc_handle=getattr(self._transfer_manager._engine, "ipc_handle_b64", None),
         )
         self._pool_result_push.send_multipart(encode_transfer_msg(allocated_msg))
 
@@ -1167,6 +1167,8 @@ class SchedulerDisaggMixin:
         dest_session_id = msg.get("dest_session_id", "")
         dest_addr = msg.get("dest_addr", 0)
         transfer_size = msg.get("transfer_size", 0)
+        dest_ipc_handle = msg.get("dest_ipc_handle")
+        dest_pool_ptr = msg.get("dest_pool_ptr", 0) or 0
 
         if self._rdma_push_queue is not None:
             # Non-blocking: enqueue to RDMA push thread
@@ -1176,6 +1178,8 @@ class SchedulerDisaggMixin:
                     dest_session_id,
                     dest_addr,
                     transfer_size,
+                    dest_ipc_handle,
+                    dest_pool_ptr,
                 )
             )
             return
@@ -1186,6 +1190,8 @@ class SchedulerDisaggMixin:
             dest_session_id=dest_session_id,
             dest_addr=dest_addr,
             transfer_size=transfer_size,
+            dest_ipc_handle=dest_ipc_handle,
+            dest_pool_ptr=dest_pool_ptr,
         )
 
         if success:

@@ -337,6 +337,257 @@ class Envs:
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
 
+    # Attention–FFN Disaggregation (StepMesh AFD) — see srt/afd/RFC.md
+    # null | attn | ffn
+    SGLANG_AFD_MODE = EnvStr("null")
+    # fake | stepmesh
+    SGLANG_AFD_TRANSPORT = EnvStr("fake")
+    SGLANG_AFD_NUM_MB = EnvInt(2)
+    SGLANG_AFD_MAX_NUM_TOKEN = EnvInt(256)
+    # P2: use StepMesh write_flag/wait_flag around push_pull (requires stepmesh + CUDA)
+    SGLANG_AFD_USE_WAIT_FLAG = EnvBool(False)
+    # P3: split tokens across NUM_MB slots and overlap A2F/F2A (disabled under TRUE_OVERLAP)
+    SGLANG_AFD_PIPELINE = EnvBool(False)
+    # P7: stagger dual-mb Attn↔FFN across layers (requires NUM_MB>=2).
+    # Forced on with TRUE_OVERLAP (AFD decode default).
+    SGLANG_AFD_LAYER_PIPELINE = EnvBool(True)
+    # StepMesh-style AFD stages (recommended 2). When >=2: forces LAYER_PIPELINE,
+    # NUM_MB=stages, disables IN_GRAPH_WAIT and token PIPELINE (P3).
+    SGLANG_AFD_STEPMESH_STAGES = EnvInt(2)
+    # Fake only: serve collocated ffn_compute on a background thread so
+    # remote_ffn_async / pipeline can overlap A2F enqueue with FFN (CPU-safe).
+    # Keep off for CUDA Fake smoke (background CUDA contexts hang).
+    SGLANG_AFD_FAKE_ASYNC_FFN = EnvBool(False)
+    # Fake async: simulated A2F transfer latency (ms) before FFN sees the batch.
+    SGLANG_AFD_FAKE_TRANSFER_MS = EnvFloat(0.0)
+    # P4: move unused role params off GPU after load
+    SGLANG_AFD_RELEASE_UNUSED_PARAMS = EnvBool(False)
+    # P4: allow AFD attn + PD prefill (off by default)
+    SGLANG_AFD_ALLOW_PREFILL_ATTN = EnvBool(False)
+    # P5: skip constructing unused modules (attn on FFN / experts on Attn)
+    SGLANG_AFD_MODULE_STUBS = EnvBool(True)
+    # P6: MoE routing on Attn (a) or FFN (b)
+    SGLANG_AFD_ROUTING_SCHEME = EnvStr("a")
+    # P6: A2F hidden wire dtype — auto|bf16|fp16|fp8
+    SGLANG_AFD_A2F_DTYPE = EnvStr("auto")
+    # MxN: Attn worker rank in StepMesh key space (default: tp_rank)
+    SGLANG_AFD_WORKER_RANK = EnvInt(-1)
+    # Emit A2F issue/wait timestamps for StepMesh timeline reports
+    SGLANG_AFD_TIMELINE = EnvBool(False)
+    # Fine split of post_to_ffn (poll vs a2f sync) and FFN compute (wall vs cuda)
+    SGLANG_AFD_PROFILE_DETAIL = EnvBool(False)
+    # FFN worker: capture CUDA graphs for MLP/MoE compute (not model-level decode CG)
+    SGLANG_AFD_FFN_CUDA_GRAPH = EnvBool(True)
+    # Same-host cuda_ipc transport: Unix socket for CUDA IPC handle exchange
+    SGLANG_AFD_IPC_ENDPOINT = EnvStr("/tmp/afd_cuda_ipc.sock")
+    # P8: GPU write_flag/wait_flag inside decode CUDA Graph (full backend);
+    # CPU thread runs transport push_pull+wait. Works with cuda_ipc or stepmesh.
+    SGLANG_AFD_IN_GRAPH_WAIT = EnvBool(False)
+    # FFN: wait up to this many microseconds to gather more ready mb slots
+    # (same-layer concat). 0 = disabled (return first ready slot).
+    SGLANG_AFD_FFN_GATHER_US = EnvInt(0)
+    # FFN: max mb slots to gather into one compute when gather_us > 0.
+    SGLANG_AFD_FFN_GATHER_MAX = EnvInt(4)
+    # FFN per-layer bounded queue. This gathers ready A2F hops before compute,
+    # independent of the short transport-level gather above.
+    SGLANG_AFD_FFN_QUEUE_ENABLE = EnvBool(False)
+    # Dispatch a layer once it holds this many tokens (or max hops / deadline).
+    SGLANG_AFD_FFN_QUEUE_TARGET_TOKENS = EnvInt(64)
+    # Maximum time a head-of-layer hop may wait for more same-layer work.
+    SGLANG_AFD_FFN_QUEUE_MAX_WAIT_US = EnvInt(300)
+    # Per-layer and global bounds on hops held by the queue.
+    SGLANG_AFD_FFN_QUEUE_MAX_HOPS = EnvInt(4)
+    SGLANG_AFD_FFN_QUEUE_MAX_GLOBAL_HOPS = EnvInt(16)
+    # Attn-side per-layer outbound queue. It snapshots post-Attn microbatches
+    # and coalesces same-layer hops before consuming an A2F slot.
+    SGLANG_AFD_ATTN_QUEUE_ENABLE = EnvBool(False)
+    # Keep the first pipeline layer on the direct path to avoid serializing
+    # the dependency wavefront before it has any same-layer peers.
+    SGLANG_AFD_ATTN_QUEUE_BYPASS_FIRST_LAYER = EnvBool(True)
+    # Flush a layer once it holds this many tokens (or max hops / deadline).
+    SGLANG_AFD_ATTN_QUEUE_TARGET_TOKENS = EnvInt(64)
+    # Maximum time the oldest outbound hop may wait for same-layer work.
+    SGLANG_AFD_ATTN_QUEUE_MAX_WAIT_US = EnvInt(200)
+    # Maximum hops coalesced into one A2F call.
+    SGLANG_AFD_ATTN_QUEUE_MAX_HOPS = EnvInt(4)
+    # Log queue statistics every N issued groups (0 = silent).
+    SGLANG_AFD_ATTN_QUEUE_STATS_EVERY = EnvInt(0)
+    # FFN: run ready microbatches on separate CUDA streams (cuts peer-mb poll wait).
+    SGLANG_AFD_FFN_PARALLEL_MB = EnvBool(False)
+    # Experimental: capture FFN CUDA graphs against IPC shared tensors (often unsafe).
+    SGLANG_AFD_FFN_SHARED_IO = EnvBool(False)
+    # Fewer RTTs: dense MLP stays on Attn (no remote for DeepseekV2MLP layers).
+    SGLANG_AFD_REMOTE_MOE_ONLY = EnvBool(False)
+    # Deprecated / ignored: must stay 0 (all layers remote). Values >0 are clamped.
+    SGLANG_AFD_REMOTE_FROM_LAYER = EnvInt(0)
+    # Required Attn∥FFN overlap: NUM_MB>=2 + LAYER_PIPELINE + breakable CG +
+    # deferred wait. Forced on at AFD bootstrap; IN_GRAPH_WAIT is disabled.
+    SGLANG_AFD_TRUE_OVERLAP = EnvBool(True)
+    # Layer-group merge: K transformer layers per A2F/F2A. K=1 off.
+    # Interior Attn+KV run on FFN; forces REMOTE_FROM_LAYER=0 and disables IN_GRAPH.
+    SGLANG_AFD_LAYER_MERGE_K = EnvInt(1)
+    # AfPool MxN (experimental): Attn/FFN work-pool over cuda_ipc. Default off —
+    # keeps classic 1A1F TRUE_OVERLAP. When on, KPI is tok/s + FFN util.
+    SGLANG_AFD_POOL = EnvBool(False)
+    SGLANG_AFD_POOL_NUM_ATTN = EnvInt(1)
+    SGLANG_AFD_POOL_NUM_FFN = EnvInt(1)
+    SGLANG_AFD_POOL_MAX_INFLIGHT_PER_FFN = EnvInt(4)
+    # Preserve the conservative serve-loop behavior by default. Disable for
+    # pipelined FFN batch issue; per-slot events still protect transport reuse.
+    SGLANG_AFD_POOL_SERVE_SYNC = EnvBool(True)
+    SGLANG_AFD_POOL_ENDPOINT_DIR = EnvStr("/tmp/afd_pool")
+    # least_inflight | rr
+    SGLANG_AFD_POOL_ROUTE = EnvStr("least_inflight")
+    # Local rank inside Attn or FFN pool (0 .. NUM_* - 1). -1 → WORKER_RANK or 0.
+    SGLANG_AFD_POOL_LOCAL_RANK = EnvInt(-1)
+    # Decode farm (P0/P1): tokens at different layers in one decode step.
+    # Replaces lockstep layer-pipeline. cuda_ipc (or Fake). Default off.
+    SGLANG_AFD_FARM = EnvBool(False)
+    # Max sequences dequeued per Attn window (B_step). Typical {8,16,32}.
+    SGLANG_AFD_FARM_B_STEP = EnvInt(16)
+    # Number of independent sequence-context wavefronts. Contexts may be
+    # smaller than B_step so sequence groups can advance at different layers.
+    SGLANG_AFD_FARM_NUM_CONTEXTS = EnvInt(2)
+    # Layer lead before injecting the next sequence context. 0 restores the
+    # legacy behavior where every context starts at layer 0 together.
+    SGLANG_AFD_FARM_CONTEXT_STAGGER_LAYERS = EnvInt(1)
+    # Contexts admitted together at one stage. Same-stage contexts are
+    # coalesced into one A2F call when they occupy the same layer.
+    SGLANG_AFD_FARM_CONTEXTS_PER_STAGE = EnvInt(1)
+    # Sticky same-layer windows before re-picking a layer (B_win / K).
+    SGLANG_AFD_FARM_B_WIN_K = EnvInt(8)
+    # Max in-flight A2F hops (also used to bump NUM_MB).
+    SGLANG_AFD_FARM_MAX_INFLIGHT = EnvInt(4)
+    # Max in-flight A2F hops from one layer. 0 = auto (min(max_inflight, 4)).
+    # A finite cap prevents one ready layer from occupying every MB slot and
+    # starving the next layer in the dependency wavefront.
+    SGLANG_AFD_FARM_MAX_INFLIGHT_PER_LAYER = EnvInt(0)
+    # Bounded poll window when no farm work can be issued. 0 preserves the
+    # original fully blocking wait on the oldest hop.
+    SGLANG_AFD_FARM_WAIT_SLICE_US = EnvInt(250)
+    # Persistent farm runtime: sequence contexts (hidden/residual/positions,
+    # pending hop, child ForwardBatch) survive across ``model.forward()`` so
+    # different sequences can sit at different layers/token steps. One forward
+    # may return zero sampled tokens. 0 keeps the one-shot intra-forward farm.
+    SGLANG_AFD_FARM_PERSISTENT = EnvBool(False)
+    # Max consecutive forwards a single context may stay live before the
+    # runtime stops admitting new work for it (0 = unbounded).
+    SGLANG_AFD_FARM_PERSISTENT_MAX_AGE = EnvInt(0)
+    # Poll budget (us) per forward for pending hops. 0 = pure non-blocking poll
+    # so the forward never sleeps; >0 allows one bounded drain window.
+    SGLANG_AFD_FARM_PERSISTENT_POLL_US = EnvInt(0)
+    # Number of groups the persistent farm partitions a decode batch into. Each
+    # group is one context whose members share a layer, so one A2F hop carries
+    # the whole group. 0 keeps the one-context-per-row behaviour (1 token/hop).
+    # G groups give G fat independent chains instead of `rows` thin ones; the win
+    # is that a hop costs the FFN a fixed host dispatch regardless of token count.
+    SGLANG_AFD_FARM_PERSISTENT_GROUPS = EnvInt(0)
+    # If FFN_GATHER_US is 0, farm sets it to this (LPU-sim same-layer gather).
+    SGLANG_AFD_FARM_LPU_GATHER_US = EnvInt(50)
+    # MoE combine (moe_sum_reduce) via @torch.compile for small token counts.    # progress.md §14: on this box Dynamo's per-call re-guard makes it 9x slower
+    # than the plain sgl_kernel op for the farm's ~4-16 token hops, and its pure
+    # Python guard evaluation holds the GIL away from the FFN poll thread.
+    # 1 = stock upstream behaviour (torch.compile for num_tokens <= 32).
+    SGLANG_AFD_MOE_SUM_REDUCE_COMPILE = EnvInt(1)
+    # Minimum interval (ms) between full ``Scheduler.on_idle`` housekeeping
+    # passes. 0 keeps upstream behaviour (every idle loop iteration). The idle
+    # path is pure Python that holds the GIL, and an AFD FFN server never runs
+    # real requests, so it spins that path thousands of times a second and
+    # starves the FFN compute thread (progress.md §15).
+    SGLANG_IDLE_HOUSEKEEPING_INTERVAL_MS = EnvInt(0)
+    # Log occupancy every N decode farm forwards (0 = silent).
+    SGLANG_AFD_FARM_LOG_EVERY = EnvInt(32)
+    # P3 soft-persistent proxy (8-card): first B_step in a B_win pays weight tax.
+    SGLANG_AFD_FARM_SOFT_PERSISTENT = EnvBool(False)
+    # Host busy-wait microseconds on win_index==0 (Lite-scale default).
+    SGLANG_AFD_FARM_WEIGHT_TAX_US = EnvFloat(100.0)
+    # Optional HBM copy burn bytes on first window (0 = off, saves memory).
+    SGLANG_AFD_FARM_WEIGHT_TAX_BYTES = EnvInt(0)
+    # P2 true amortize: dequeue up to COALESCE_K * B_step tokens into one Attn
+    # launch (stock kernels see larger M). 1 = disabled (single B_step).
+    SGLANG_AFD_FARM_COALESCE_K = EnvInt(1)
+    # Optional cap on tokens dequeued from one layer per pick. 0 preserves the
+    # legacy COALESCE_K * B_STEP burst; small values improve cross-layer overlap.
+    SGLANG_AFD_FARM_LAYER_BURST = EnvInt(0)
+    # max = legacy sticky/largest-queue; oldest = advance the lowest ready layer.
+    SGLANG_AFD_FARM_SCHED = EnvStr("max")
+    # True pipeline (1F1B): split the decode batch into this many microbatches
+    # and inject them at layer 0 at staggered times, so different microbatches
+    # occupy different layers concurrently (layers_peak > 1). Without this the
+    # wavefront is flat (all tokens share a layer) and no cross-layer overlap is
+    # possible. 0/1 = disabled (legacy: enqueue every sequence at layer 0).
+    SGLANG_AFD_FARM_STAGGER_MB = EnvInt(0)
+    # Layers the leading microbatch must advance before the next one is injected.
+    SGLANG_AFD_FARM_STAGGER_SPAN = EnvInt(2)
+    # Diagnostics: per-phase wall-clock breakdown of the farm decode loop.
+    SGLANG_AFD_FARM_PHASE_TIMING = EnvBool(False)
+    # P3: try per-(layer, n_tok) CUDAGraph replay of forward_pre_ffn. Falls
+    # back to eager when capture fails (common with FlashInfer host launch).
+    SGLANG_AFD_FARM_LAYER_CG = EnvBool(False)
+    # P3: Triton weight-outer / mb-inner linear on MLA projections (FP16/BF16).
+    SGLANG_AFD_FARM_PERSISTENT_LINEAR = EnvBool(False)
+    # P3c: spin-wait style session — keep W resident, push B_step mbs without
+    # coalescing wait (host-driven; see farm/spin_wait_linear.py).
+    SGLANG_AFD_FARM_SPIN_WAIT = EnvBool(False)
+    # P0: hard cap on tokens holding an A2F credit (running) across all layers.
+    # Reservation is refused once the budget would be exceeded; waiting backlog
+    # is untouched. 0 = auto (MAX_INFLIGHT * B_STEP, i.e. the natural ceiling
+    # implied by the hop cap); negative disables the budget entirely.
+    SGLANG_AFD_FARM_GLOBAL_TOKEN_BUDGET = EnvInt(0)
+    # P0: scheduling-round age at which a waiting window stops being polite:
+    # it bypasses COALESCE_K (single B_step burst) and outranks sticky layers
+    # so it cannot starve behind a sticky layer. 0 = auto (B_WIN_K); negative
+    # disables aging.
+    SGLANG_AFD_FARM_MAX_AGE_STEPS = EnvInt(0)
+    # P1: let the Attn send queue's per-layer continuous batching choose the
+    # A2F group size instead of pre-packing COALESCE_K windows on the Attn
+    # scheduler (avoids FFN seeing a singleton pair). Forces COALESCE_K=1.
+    SGLANG_AFD_FARM_NATURAL_BATCH = EnvBool(False)
+    # P1: keep the farm scheduler/queue alive across decode steps and allow a
+    # new batch to begin while an older one is still draining. Removes per-step
+    # teardown; true cross-step pipelining additionally needs the model runner
+    # to defer its OutputBarrier (see farm/README.md).
+    SGLANG_AFD_FARM_PERSISTENT = EnvBool(False)
+    # Build a sliced SamplingBatchInfo on *intermediate* farm hops too. Only the
+    # hop that finishes a sequence is ever handed to the sampler, so for the
+    # other 26 layers this is dead work on the attn critical path (py-spy §19:
+    # slice_sampling_info ~11% of farm time). Kept as an escape hatch.
+    SGLANG_AFD_FARM_MID_SAMPLING_INFO = EnvBool(False)
+    # P1: reserved for concurrent active batches. Not implemented yet: queue
+    # entries are bare indices into one decode forward's tensors, so a second
+    # live batch would slice garbage. Concurrent batches also cannot overlap
+    # across steps without a deferred consumer (the model forward finalises
+    # logits immediately after the farm). Kept at 1; see farm/README.md.
+    SGLANG_AFD_FARM_MAX_ACTIVE_BATCHES = EnvInt(1)
+
+    # --- Fake MoE EP communication (fair full-decode baseline vs AF hop) ---
+    # When on, each DeepseekV2MoE.forward pays dispatch+combine traffic tax
+    # sized like DeepEP: 2 * N * topk * H * elem * (1-1/ep).
+    SGLANG_FAKE_EP_COMM = EnvBool(False)
+    # Assumed expert-parallel world size for the volume model.
+    SGLANG_FAKE_EP_SIZE = EnvInt(8)
+    # Effective interconnect bandwidth (GB/s) for delay-mode timing model.
+    SGLANG_FAKE_EP_BW_GBS = EnvFloat(150.0)
+    # Fixed per-layer launch latency (microseconds), applied in delay mode.
+    SGLANG_FAKE_EP_LAT_US = EnvFloat(10.0)
+    # delay | copy | nvlink
+    SGLANG_FAKE_EP_MODE = EnvStr("copy")
+    # Peer CUDA index for nvlink mode (must be visible in this process).
+    SGLANG_FAKE_EP_PEER_GPU = EnvInt(-1)
+    # If true, only tax AFD mode=null (colocated full). AF attn/ffn skip the tax.
+    SGLANG_FAKE_EP_FULL_ONLY = EnvBool(True)
+    # Optional volume overrides (0 = use real model topk / hidden).
+    # Use with Lite weights to mimic V3-sized dispatch/combine payloads.
+    SGLANG_FAKE_EP_TOPK = EnvInt(0)
+    SGLANG_FAKE_EP_HIDDEN = EnvInt(0)
+    # Extra multiplier on top of the volume model (layer-density, etc.).
+    SGLANG_FAKE_EP_BYTES_SCALE = EnvFloat(1.0)
+    # Extra MoE FLOPs as GEMM burn: scale≈1 means ~one [T,H]@[H,H]; V3-proxy ~7.
+    # Applies on every DeepseekV2MoE.forward (PD decode + AF FFN), not Attn stubs.
+    SGLANG_FAKE_MOE_COMPUTE_SCALE = EnvFloat(0.0)
+    # Named profile: "" | "v3_proxy" (sets EP/topk/hidden/bytes/compute for Lite).
+    SGLANG_FAKE_V3_PROFILE = EnvStr("")
+
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
@@ -861,6 +1112,25 @@ class Envs:
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+
+    # Single-group grouped top-k (n_group == topk_group == 1) over a softmax collapses
+    # to a plain top-k, so run it as one fused ``topk_softmax`` kernel instead of the
+    # ~8-op eager chain inside compiled ``grouped_topk_gpu``. ~8x faster at decode
+    # batch sizes and strictly more accurate (fp32 softmax instead of bf16).
+    SGLANG_OPT_DEGENERATE_GROUPED_TOPK_FUSED = EnvBool(True)
+
+    # Fuse ``q_proj`` + ``kv_a_proj_with_mqa`` into one GEMM on the no-LoRA MLA path
+    # (``q_lora_rank is None``). Both read the same ``hidden_states``, so at decode
+    # batch sizes the second launch is pure dispatch overhead. The checkpoint splits
+    # them; the loader concatenates them on load. Only engaged when attn_tp_size == 1
+    # and quantization is off -- ``q_proj`` is ColumnParallelLinear (output-sharded)
+    # while ``kv_a_proj_with_mqa`` is replicated, so a single replicated weight is
+    # only equivalent with no sharding. Default off: A/B only.
+    SGLANG_OPT_FUSE_QKV_A_PROJ_NOLORA = EnvBool(False)
+
+    # Temporary: one-shot check that the fused weight matches the concatenation
+    # of the two checkpoint weights (verify aid for the flag above).
+    SGLANG_OPT_FUSE_QKV_A_PROJ_NOLORA_VERIFY = EnvBool(False)
 
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)

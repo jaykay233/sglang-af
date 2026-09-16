@@ -130,6 +130,58 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
         )
         self.distilled_sigmas = torch.tensor(distilled_sigmas)
 
+    def _maybe_enable_cache_dit(self, num_inference_steps: int, batch: Req) -> None:
+        """Use secondary / aggressive Cache-DiT knobs for short distilled refine.
+
+        Stage-2 is typically 3 steps at higher resolution; the primary warmup=4
+        never caches, and the default RDT=0.24 rarely hits. Prefer secondary
+        env overrides (defaulting to warmup=1, RDT=0.48).
+        """
+        if getattr(self, "_disable_cache_dit_for_request", False):
+            return
+
+        import os
+
+        overrides = {
+            "SGLANG_CACHE_DIT_WARMUP": os.environ.get(
+                "SGLANG_CACHE_DIT_SECONDARY_WARMUP", "1"
+            ),
+            "SGLANG_CACHE_DIT_RDT": os.environ.get(
+                "SGLANG_CACHE_DIT_SECONDARY_RDT", "0.48"
+            ),
+            "SGLANG_CACHE_DIT_MC": os.environ.get(
+                "SGLANG_CACHE_DIT_SECONDARY_MC",
+                os.environ.get("SGLANG_CACHE_DIT_MC", "3"),
+            ),
+            "SGLANG_CACHE_DIT_FN": os.environ.get(
+                "SGLANG_CACHE_DIT_SECONDARY_FN",
+                os.environ.get("SGLANG_CACHE_DIT_FN", "1"),
+            ),
+            "SGLANG_CACHE_DIT_BN": os.environ.get(
+                "SGLANG_CACHE_DIT_SECONDARY_BN",
+                os.environ.get("SGLANG_CACHE_DIT_BN", "0"),
+            ),
+        }
+        previous = {key: os.environ.get(key) for key in overrides}
+        try:
+            os.environ.update(overrides)
+            logger.info(
+                "LTX refine Cache-DiT knobs: W=%s RDT=%s MC=%s Fn=%s Bn=%s (steps=%s)",
+                overrides["SGLANG_CACHE_DIT_WARMUP"],
+                overrides["SGLANG_CACHE_DIT_RDT"],
+                overrides["SGLANG_CACHE_DIT_MC"],
+                overrides["SGLANG_CACHE_DIT_FN"],
+                overrides["SGLANG_CACHE_DIT_BN"],
+                num_inference_steps,
+            )
+            return super()._maybe_enable_cache_dit(num_inference_steps, batch)
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:

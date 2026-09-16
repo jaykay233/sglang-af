@@ -587,14 +587,76 @@ def alloc_paged_token_slots_decode(
     return out_cache_loc
 
 
-def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+def alloc_for_decode(
+    batch: ScheduleBatch,
+    token_per_req: int,
+    ready_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """
     Allocate KV cache for decode batch and write to req_to_token_pool.
+
+    When ``ready_mask`` is given (AFD farm persistent runtime), only rows that
+    produced a token this forward allocate a slot and write the KV table. Rows
+    that were deferred keep their previously allocated slot and must not have
+    their ``req_to_token_pool`` entry rewritten.
 
     Returns:
         out_cache_loc: allocated cache locations
     """
+    if ready_mask is None:
+        return _alloc_for_decode_rows(batch, token_per_req)
 
+    mask = ready_mask.to(batch.seq_lens.device).bool()
+    full = torch.zeros(
+        int(batch.seq_lens.shape[0]), dtype=torch.int32, device=batch.seq_lens.device
+    )
+    ready_idx = torch.nonzero(mask, as_tuple=False).flatten()
+    if ready_idx.numel() == 0:
+        # Nothing sampled this forward: no allocation, no KV writes.
+        batch.out_cache_loc_is_dummy = True
+        return full
+    sub = _MaskedDecodeBatch(batch, ready_idx)
+    batch.maybe_evict_swa()
+    sub_out = _alloc_for_decode_rows(sub, token_per_req)
+    full[ready_idx] = sub_out.to(torch.int32)
+    batch.out_cache_loc_is_dummy = bool(ready_idx.numel() != mask.numel())
+    return full
+
+
+class _MaskedDecodeBatch:
+    """Row-subset view of a ``ScheduleBatch`` for masked KV allocation.
+
+    Only the attributes read by :func:`_alloc_for_decode_rows` are forwarded.
+    ``req_to_token_pool`` and ``tree_cache`` are shared, which is what makes the
+    write land in the real pool for the ready rows only.
+    """
+
+    def __init__(self, batch: ScheduleBatch, rows: torch.Tensor) -> None:
+        self._batch = batch
+        self._rows = rows
+        self.tree_cache = batch.tree_cache
+        self.req_to_token_pool = batch.req_to_token_pool
+        self.model_config = batch.model_config
+        self.token_to_kv_pool_allocator = batch.token_to_kv_pool_allocator
+        self.req_pool_indices = batch.req_pool_indices[rows]
+        self.seq_lens = batch.seq_lens[rows]
+        if batch.seq_lens_cpu is None:
+            self.seq_lens_cpu = None
+        else:
+            # The CPU mirror lives on the host, so it needs host row indices.
+            rows_cpu = rows if rows.device.type == "cpu" else rows.to("cpu")
+            self.seq_lens_cpu = batch.seq_lens_cpu[rows_cpu]
+        self.seq_lens_sum = None
+        # Masked rows never take the NPU DSV4 hooks; keep them off explicitly.
+        self.out_cache_loc_dsv4 = None
+        self.req_to_token_pool_indices = self.req_pool_indices
+
+    def maybe_evict_swa(self) -> None:
+        return None
+
+
+def _alloc_for_decode_rows(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+    """Unmasked KV allocation for ``batch`` (all rows are ready)."""
     batch.maybe_evict_swa()
 
     seq_lens_gpu = batch.seq_lens

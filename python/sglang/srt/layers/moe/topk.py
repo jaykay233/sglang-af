@@ -891,6 +891,76 @@ def grouped_topk_gpu(
     return topk_weights, topk_ids
 
 
+def degenerate_grouped_topk_fused(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: Optional[float] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+):
+    """``grouped_topk_gpu`` for the single-group case as one fused kernel.
+
+    With ``num_expert_group == topk_group == 1`` the group mask is all-True, so
+    ``masked_fill`` is the identity and the whole grouping machinery collapses to a
+    plain top-k over the softmax. Running it eagerly still costs ~160us per layer at
+    decode batch sizes (E=66, M<=128 on A800) because that is a chain of ~8 tiny
+    kernels, each paying full launch overhead. ``topk_softmax`` does the same thing in
+    one launch for ~19us.
+
+    It is also *more* accurate: the baseline takes the top-k over a bf16 softmax
+    (max abs weight error ~4.9e-4), whereas the kernel computes the softmax in fp32
+    (~1.5e-8). The two still disagree on ~0.5-1.3% of id slots at M>=64, but every
+    such case is an *exact* tie -- the raw gate logits and fp32 probabilities of the
+    swapped experts are bit-identical (bf16 gate outputs tie easily) and the two
+    implementations merely break the tie differently. Both selections therefore cover
+    the same multiset of probabilities; neither drops a strictly better expert.
+
+    Returns tensors of width ``topk``; when ``num_fused_shared_experts > 0`` the
+    trailing shared slots are zero-filled placeholders. Callers that carry the shared
+    experts as real MoE slots (AFD scheme A) overwrite those columns downstream with
+    the shared ids and weight 1.0; the placeholder only preserves the width contract.
+    """
+    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+    assert 0 <= num_fused_shared_experts < topk, (
+        f"num_fused_shared_experts={num_fused_shared_experts} must be in [0, {topk})"
+    )
+
+    num_routed_topk = topk - num_fused_shared_experts
+    num_token = gating_output.shape[0]
+    device = gating_output.device
+
+    routed_weights = torch.empty(
+        num_token, num_routed_topk, dtype=torch.float32, device=device
+    )
+    routed_ids = torch.empty(
+        num_token, num_routed_topk, dtype=torch.int32, device=device
+    )
+    if num_token > 0:
+        topk_softmax(
+            routed_weights,
+            routed_ids,
+            gating_output,
+            # renormalize must use the routed sum only; with shared slots folded into
+            # ``topk`` the baseline divides by ``topk_weights[:, :-1].sum()``, which is
+            # exactly the fused kernel's renormalization over its own top-k.
+            bool(renormalize),
+        )
+        if apply_routed_scaling_factor_on_output:
+            routed_weights *= routed_scaling_factor
+
+    if num_fused_shared_experts == 0:
+        return routed_weights, routed_ids
+
+    pad_weights = routed_weights.new_zeros(num_token, num_fused_shared_experts)
+    pad_ids = routed_ids.new_zeros(num_token, num_fused_shared_experts)
+    return (
+        torch.cat((routed_weights, pad_weights), dim=1),
+        torch.cat((routed_ids, pad_ids), dim=1),
+    )
+
+
 def grouped_topk_cpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1923,17 +1993,51 @@ def select_experts(
         assert topk_group is not None
         assert num_expert_group is not None
         if correction_bias is None:
-            topk_weights, topk_ids = grouped_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=num_routed_topk if _use_aiter else top_k,
-                renormalize=renormalize,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-                num_fused_shared_experts=num_fused_shared_experts,
-                routed_scaling_factor=routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            # Single-group softmax routing is a plain top-k over the softmax; run it
+            # as one fused kernel instead of the eager chain in grouped_topk_gpu.
+            #
+            # ``grouped_topk_gpu`` only folds *one* shared expert into the last column
+            # regardless of ``num_fused_shared_experts``, and its renormalization then
+            # divides by the top-``top_k - 1`` sum. That matches the fused path (which
+            # divides by its own top-k) only when at most one shared expert is folded
+            # in, so require that whenever renormalization is on. With F >= 2 and
+            # renormalize off the routed columns are plain softmax values and the
+            # trailing shared slots are rewritten by the caller, so it is still exact.
+            _degenerate_fused_ok = (
+                num_fused_shared_experts <= 1 or not renormalize
             )
+            if (
+                _is_cuda
+                and not _use_aiter
+                and envs.SGLANG_OPT_DEGENERATE_GROUPED_TOPK_FUSED.get()
+                and num_expert_group == 1
+                and topk_group == 1
+                and scoring_func == "softmax"
+                and expert_location_dispatch_info is None
+                and _degenerate_fused_ok
+                and num_fused_shared_experts < top_k
+            ):
+                topk_weights, topk_ids = degenerate_grouped_topk_fused(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    topk=top_k,
+                    renormalize=renormalize,
+                    num_fused_shared_experts=num_fused_shared_experts,
+                    routed_scaling_factor=routed_scaling_factor,
+                    apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                )
+            else:
+                topk_weights, topk_ids = grouped_topk(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    topk=num_routed_topk if _use_aiter else top_k,
+                    renormalize=renormalize,
+                    num_expert_group=num_expert_group,
+                    topk_group=topk_group,
+                    num_fused_shared_experts=num_fused_shared_experts,
+                    routed_scaling_factor=routed_scaling_factor,
+                    apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                )
         else:
             topk_weights, topk_ids = biased_grouped_topk(
                 hidden_states=hidden_states,

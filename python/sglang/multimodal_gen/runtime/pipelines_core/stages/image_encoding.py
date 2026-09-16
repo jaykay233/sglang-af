@@ -458,11 +458,20 @@ class LTX2ImageEncodingStage(PipelineStage):
         "ltx2_num_image_tokens",
     )
 
-    def __init__(self, vae=None, **kwargs) -> None:
+    def __init__(self, vae=None, role_affinity=None, **kwargs) -> None:
         super().__init__()
         self.vae = vae
         self._condition_image_encoder = None
         self._condition_image_encoder_dir = None
+        self._role_affinity_override = role_affinity
+
+    @property
+    def role_affinity(self):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        if self._role_affinity_override is not None:
+            return self._role_affinity_override
+        return RoleType.ENCODER
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None

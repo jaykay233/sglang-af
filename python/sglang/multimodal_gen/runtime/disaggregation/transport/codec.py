@@ -10,10 +10,23 @@ import json
 import logging
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import zmq
 
 logger = logging.getLogger(__name__)
+
+
+def _as_torch_tensor(value) -> torch.Tensor:
+    """Normalize Tensor / ndarray payloads for the ZMQ tensor codec."""
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, np.ndarray):
+        # torch.from_numpy requires a writable array; copy if needed.
+        if not value.flags.writeable:
+            value = np.array(value)
+        return torch.from_numpy(value)
+    raise TypeError(f"Expected Tensor or ndarray, got {type(value)}")
 
 _DTYPE_TO_STR = {
     torch.float16: "float16",
@@ -48,7 +61,7 @@ class TensorWrapper:
     """Expose a CPU-contiguous tensor's data buffer for zero-copy ZMQ send."""
 
     def __init__(self, tensor: torch.Tensor):
-        if tensor.is_cuda or tensor.is_npu:
+        if tensor.is_cuda or getattr(tensor, "is_npu", False):
             tensor = tensor.cpu()
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
@@ -96,13 +109,14 @@ def pack_tensors(
         if value is None:
             continue
 
-        if isinstance(value, torch.Tensor):
-            wrapper = TensorWrapper(value)
+        if isinstance(value, (torch.Tensor, np.ndarray)):
+            tensor = _as_torch_tensor(value)
+            wrapper = TensorWrapper(tensor)
             descriptors.append(
                 TensorDescriptor(
                     field_name=field_name,
-                    shape=list(value.shape),
-                    dtype=dtype_to_str(value.dtype),
+                    shape=list(tensor.shape),
+                    dtype=dtype_to_str(tensor.dtype),
                 )
             )
             buffers.append(wrapper)
@@ -111,21 +125,21 @@ def pack_tensors(
             for i, t in enumerate(value):
                 if t is None:
                     continue
-                if not isinstance(t, torch.Tensor):
-                    raise TypeError(
-                        f"Expected Tensor in list for field '{field_name}', "
-                        f"got {type(t)}"
-                    )
-                wrapper = TensorWrapper(t)
+                tensor = _as_torch_tensor(t)
+                wrapper = TensorWrapper(tensor)
                 descriptors.append(
                     TensorDescriptor(
                         field_name=field_name,
-                        shape=list(t.shape),
-                        dtype=dtype_to_str(t.dtype),
+                        shape=list(tensor.shape),
+                        dtype=dtype_to_str(tensor.dtype),
                         list_index=i,
                     )
                 )
                 buffers.append(wrapper)
+        else:
+            raise TypeError(
+                f"Unsupported transfer field '{field_name}' type: {type(value)}"
+            )
 
     metadata = {
         "tensor_descriptors": [d.to_dict() for d in descriptors],

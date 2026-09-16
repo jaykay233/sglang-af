@@ -504,6 +504,18 @@ class TpModelWorker(BaseTpWorker):
             return self._forward_batch_generation_dllm(forward_batch)
 
         if self.pp_group.is_last_rank:
+            for name in (
+                "_afd_farm_sample_fn",
+                "_afd_farm_context_sampler",
+                "_afd_farm_logits_output",
+                "_afd_farm_next_token_ids",
+                "_afd_farm_handled",
+                "_afd_farm_ready_req_pool_indices",
+                "_afd_farm_deferred_req_pool_indices",
+            ):
+                if hasattr(forward_batch, name):
+                    delattr(forward_batch, name)
+            forward_batch._afd_farm_sample_fn = self.model_runner.sample
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
@@ -519,6 +531,44 @@ class TpModelWorker(BaseTpWorker):
 
             if is_verify:
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
+                return batch_result
+
+            # AFD farm persistent runtime: partial-ready protocol. The farm
+            # returns results only for rows it sampled this forward; deferred
+            # rows keep their in-flight layer state and must not advance.
+            farm_ready = getattr(
+                forward_batch, "_afd_farm_ready_req_pool_indices", None
+            )
+            if farm_ready is not None:
+                device = forward_batch.req_pool_indices.device
+                batch_result.ready_req_pool_indices = torch.tensor(
+                    [int(x) for x in farm_ready],
+                    dtype=torch.long,
+                    device=device,
+                )
+                deferred = (
+                    getattr(
+                        forward_batch, "_afd_farm_deferred_req_pool_indices", None
+                    )
+                    or []
+                )
+                batch_result.deferred_req_pool_indices = torch.tensor(
+                    [int(x) for x in deferred],
+                    dtype=torch.long,
+                    device=device,
+                )
+                farm_next_token_ids = getattr(
+                    forward_batch, "_afd_farm_next_token_ids", None
+                )
+                if farm_next_token_ids is not None:
+                    batch_result.next_token_ids = farm_next_token_ids
+                return batch_result
+
+            farm_next_token_ids = getattr(
+                forward_batch, "_afd_farm_next_token_ids", None
+            )
+            if farm_next_token_ids is not None:
+                batch_result.next_token_ids = farm_next_token_ids
                 return batch_result
 
             if (

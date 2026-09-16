@@ -2610,6 +2610,39 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             latest_output_ids
         )
 
+    def _afd_farm_ready_mask(self):
+        """Per-row ready mask for AFD farm deferrals, or None for all-ready.
+
+        Deferral is keyed by ``req_pool_idx`` because the running batch may be
+        merged or filtered before this runs, and is read from the live farm
+        runtime rather than from any state carried on this batch (see
+        ``farm_ready_row_mask``).
+        """
+        from sglang.srt.afd.farm.persistent_runtime import farm_ready_row_mask
+
+        return farm_ready_row_mask(self.req_pool_indices)
+
+    def _advance_ready_seq_lens(self, ready_mask: torch.Tensor) -> None:
+        """Advance seq-len bookkeeping for AFD-farm ready rows only.
+
+        Deferred rows must keep their position so the farm context that still
+        owns their in-flight token can finish against the same KV slot.
+        """
+        mask = ready_mask.to(self.seq_lens.device).bool()
+        step = mask.to(self.seq_lens.dtype)
+        if self.enable_overlap:
+            # New tensors: model_worker_batch may still reference the old ones.
+            self.seq_lens = self.seq_lens + step
+            self.orig_seq_lens = self.orig_seq_lens + step
+            if self.seq_lens_cpu is not None:
+                self.seq_lens_cpu = self.seq_lens_cpu + step.to("cpu")
+        else:
+            self.seq_lens[mask] = self.seq_lens[mask] + 1
+            self.orig_seq_lens[mask] = self.orig_seq_lens[mask] + 1
+            if self.seq_lens_cpu is not None:
+                cpu_mask = mask.to("cpu")
+                self.seq_lens_cpu[cpu_mask] = self.seq_lens_cpu[cpu_mask] + 1
+
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         # Decode embeds the last output token via embed_tokens; clear the stale
@@ -2636,28 +2669,50 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
 
+        # AFD farm persistent runtime: only rows that produced a token this
+        # forward may advance. Deferred rows keep their seq_len, decode index
+        # and KV watermark so their in-flight layer state stays consistent.
+        ready_mask = self._afd_farm_ready_mask()
+
         # Allocate memory (DSV4-NPU c{4,128}_state alloc lens are computed inside
         # the allocator, triggered from mem_cache/common.py.)
-        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        self.out_cache_loc = alloc_for_decode(
+            self, token_per_req=1, ready_mask=ready_mask
+        )
 
         # Update req-level memory management fields
-        for req in self.reqs:
-            req.decode_batch_idx += 1
-            req.kv_committed_len += 1
-            req.kv_allocated_len += 1
-
-        if self.enable_overlap:
-            # New-tensor avoids racing model_worker_batch refs queued for
-            # overlap forward.
-            self.seq_lens = self.seq_lens + 1
-            self.seq_lens_cpu = self.seq_lens_cpu + 1
-            self.orig_seq_lens = self.orig_seq_lens + 1
+        if ready_mask is None:
+            for req in self.reqs:
+                req.decode_batch_idx += 1
+                req.kv_committed_len += 1
+                req.kv_allocated_len += 1
         else:
-            self.seq_lens.add_(1)
-            self.seq_lens_cpu.add_(1)
-            self.orig_seq_lens.add_(1)
+            mask_cpu = [bool(v) for v in ready_mask.tolist()]
+            for req, ready in zip(self.reqs, mask_cpu):
+                if not ready:
+                    continue
+                req.decode_batch_idx += 1
+                req.kv_committed_len += 1
+                req.kv_allocated_len += 1
+
+        if ready_mask is None:
+            if self.enable_overlap:
+                # New-tensor avoids racing model_worker_batch refs queued for
+                # overlap forward.
+                self.seq_lens = self.seq_lens + 1
+                self.seq_lens_cpu = self.seq_lens_cpu + 1
+                self.orig_seq_lens = self.orig_seq_lens + 1
+            else:
+                self.seq_lens.add_(1)
+                self.seq_lens_cpu.add_(1)
+                self.orig_seq_lens.add_(1)
+        else:
+            self._advance_ready_seq_lens(ready_mask)
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
+        # Consumed: a later non-decode step must not reuse a stale mask.
+        if hasattr(self, "afd_farm_deferred_req_pool_indices"):
+            self.afd_farm_deferred_req_pool_indices = None
 
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.map_last_loc_to_buffer(

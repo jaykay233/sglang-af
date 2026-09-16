@@ -118,6 +118,7 @@ class DeepseekV2WeightLoaderMixin:
         weights = self._maybe_quant_weights_to_fp8_ue8m0(
             weights, NVFP4_CKPT_FP8_ATTN_QUANT_MODULES, nextn_conf
         )
+        weights = self._maybe_split_fused_shared_expert_weights(weights)
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -148,12 +149,19 @@ class DeepseekV2WeightLoaderMixin:
         cached_a_proj = {} if fuse_qkv_a_proj else None
 
         if self.num_fused_shared_experts > 0:
-            assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             params_dict = dict(self.named_parameters())
+            # No-LoRA MLA fusion: if the attention module exposes a fused
+            # ``fused_qkv_a_proj_nolora``, its weight is built below from the
+            # checkpoint's separate ``q_proj`` + ``kv_a_proj_with_mqa``. Detected
+            # from the module tree so it cannot drift from the model definition.
+            fuse_qkv_nolora = any(
+                n.endswith("fused_qkv_a_proj_nolora.weight") for n in params_dict
+            )
+            cached_qkv_nolora = {} if fuse_qkv_nolora else None
             weight_names = []
             for name, loaded_weight in weights:
                 use_async_loading = should_async_load(loaded_weight)
@@ -167,12 +175,6 @@ class DeepseekV2WeightLoaderMixin:
                     )
                 ):
                     continue
-                if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
-                    name = name.replace(
-                        "mlp.shared_experts",
-                        f"mlp.experts.{self.config.n_routed_experts}",
-                    )
-
                 weight_names.append(name)
 
                 match nextn_conf:
@@ -273,7 +275,69 @@ class DeepseekV2WeightLoaderMixin:
                         # Skip loading norm if not last rank in pipeline parallelism
                         if ".norm." in name and not self.pp_group.is_last_rank:
                             continue
-                        if fuse_qkv_a_proj and (
+                        if fuse_qkv_nolora and (
+                            "self_attn.q_proj" in name
+                            or "kv_a_proj_with_mqa" in name
+                        ):
+                            # Buffer the two halves until both arrive, then write
+                            # one concatenated weight into the fused module.
+                            cached_qkv_nolora[name] = loaded_weight
+                            q_name = (
+                                name
+                                if "self_attn.q_proj" in name
+                                else name.replace("kv_a_proj_with_mqa", "q_proj")
+                            )
+                            kv_name = (
+                                name
+                                if "kv_a_proj_with_mqa" in name
+                                else name.replace("q_proj", "kv_a_proj_with_mqa")
+                            )
+                            if (
+                                q_name in cached_qkv_nolora
+                                and kv_name in cached_qkv_nolora
+                            ):
+                                # Order must match the forward split
+                                # (q first, then kv_a).
+                                q_w = cached_qkv_nolora[q_name]
+                                kv_w = cached_qkv_nolora[kv_name]
+                                fused_weight = torch.cat([q_w, kv_w], dim=0)
+                                fused_param = params_dict[
+                                    q_name.replace(
+                                        "q_proj", "fused_qkv_a_proj_nolora"
+                                    )
+                                ]
+                                maybe_executor_submit(
+                                    executor=executor,
+                                    futures=futures,
+                                    use_async=use_async_loading,
+                                    func=getattr(
+                                        fused_param,
+                                        "weight_loader",
+                                        default_weight_loader,
+                                    ),
+                                    func_args=(fused_param, fused_weight),
+                                )
+                                # Also populate the unfused modules. The forward
+                                # path no longer uses them, but keeping them valid
+                                # costs a few MB and preserves an exact reference
+                                # for the equivalence check.
+                                for _n, _w in ((q_name, q_w), (kv_name, kv_w)):
+                                    _p = params_dict.get(_n)
+                                    if _p is not None:
+                                        maybe_executor_submit(
+                                            executor=executor,
+                                            futures=futures,
+                                            use_async=use_async_loading,
+                                            func=getattr(
+                                                _p,
+                                                "weight_loader",
+                                                default_weight_loader,
+                                            ),
+                                            func_args=(_p, _w),
+                                        )
+                                cached_qkv_nolora.pop(q_name)
+                                cached_qkv_nolora.pop(kv_name)
+                        elif fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
                             cached_a_proj[name] = _clone_if_runai_streamed_tensor(
@@ -373,6 +437,62 @@ class DeepseekV2WeightLoaderMixin:
                 future.result()
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+
+    def _maybe_split_fused_shared_expert_weights(self, weights):
+        """Expand a wide shared MLP into one MoE slot per shared expert."""
+        num_fused = int(self.num_fused_shared_experts or 0)
+        if num_fused <= 0:
+            yield from weights
+            return
+
+        marker = "mlp.shared_experts."
+        first_expert = int(self.config.n_routed_experts)
+        for name, loaded_weight in weights:
+            if marker not in name:
+                yield name, loaded_weight
+                continue
+
+            suffix = name.split(marker, 1)[1]
+            component, _, _tail = suffix.partition(".")
+            if num_fused == 1:
+                yield (
+                    name.replace(
+                        "mlp.shared_experts",
+                        f"mlp.experts.{first_expert}",
+                    ),
+                    loaded_weight,
+                )
+                continue
+
+            if component in ("gate_proj", "up_proj"):
+                split_dim = 0
+            elif component == "down_proj":
+                split_dim = 1
+            else:
+                raise RuntimeError(
+                    "AFD shared-expert fusion cannot split unsupported "
+                    f"checkpoint weight {name!r}"
+                )
+
+            split_size = loaded_weight.shape[split_dim] // num_fused
+            if (
+                split_size * num_fused != loaded_weight.shape[split_dim]
+                or split_size <= 0
+            ):
+                raise RuntimeError(
+                    f"Cannot evenly split {name!r} across {num_fused} "
+                    "fused shared experts."
+                )
+            for local_id in range(num_fused):
+                expert_id = first_expert + local_id
+                expert_weight = loaded_weight.narrow(
+                    split_dim, local_id * split_size, split_size
+                )
+                expert_name = name.replace(
+                    "mlp.shared_experts",
+                    f"mlp.experts.{expert_id}",
+                )
+                yield expert_name, expert_weight
 
     def _initialize_nextn_conf(self, is_nextn: bool) -> NextNConfig:
         """

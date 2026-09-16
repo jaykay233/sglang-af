@@ -785,6 +785,21 @@ class DefaultModelLoader(BaseModelLoader):
         quant_config = getattr(model, "quant_config", None)
         is_nvfp4_online = getattr(quant_config, "is_nvfp4_online", False)
 
+        # AFD P4: skip Attn-only or FFN-only tensors based on SGLANG_AFD_MODE.
+        release_unused = None
+        try:
+            from sglang.srt.afd.mode import AfdMode, get_afd_mode
+            from sglang.srt.afd.weight_filter import (
+                filter_weights_for_afd,
+                release_unneeded_parameter_storage,
+            )
+
+            if get_afd_mode() != AfdMode.NULL:
+                weights = filter_weights_for_afd(weights)
+                release_unused = release_unneeded_parameter_storage
+        except Exception as e:
+            logger.debug("AFD weight filter skipped: %s", e)
+
         if is_nvfp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
             # restore the original environment before serving starts.
@@ -798,6 +813,12 @@ class DefaultModelLoader(BaseModelLoader):
                 torch.cuda.empty_cache()
         else:
             model.load_weights(weights)
+
+        if release_unused is not None:
+            try:
+                release_unused(model)
+            except Exception as e:
+                logger.warning("AFD release unused params failed: %s", e)
 
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():

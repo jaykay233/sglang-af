@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -73,6 +74,11 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+
+# One-shot equivalence check for the fused no-LoRA qkv_a projection
+# (SGLANG_OPT_FUSE_QKV_A_PROJ_NOLORA). Temporary verification aid.
+_VERIFY_FUSED_QKV = envs.SGLANG_OPT_FUSE_QKV_A_PROJ_NOLORA_VERIFY.get()
+_fused_qkv_verified = [False]
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -238,6 +244,21 @@ class DeepseekMLAForwardMixin:
     ):
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
+        # AFD sub-phase timing (SGLANG_AFD_PROFILE_DETAIL=1).
+        try:
+            from sglang.srt.afd.detail_profile import (
+                profile_detail_enabled as _pd_on,
+                record_span as _pd_span,
+            )
+
+            _pd_timing = bool(_pd_on())
+        except Exception:
+            _pd_timing = False
+
+        def _t0() -> float:
+            return time.perf_counter() if _pd_timing else 0.0
+
+        _t_all = _t0()
         fuse_bmm_attention = (
             self.q_lora_rank is not None
             and self._can_fuse_bmm_into_attention(forward_batch)
@@ -323,8 +344,11 @@ class DeepseekMLAForwardMixin:
                             self.kv_a_layernorm.variance_epsilon,
                         )
                     else:
+                        _t = _t0()
                         q = self.q_a_layernorm(q)
                         k_nope = self.kv_a_layernorm(k_nope)
+                        if _pd_timing:
+                            _pd_span("mla_qk_norm_us", _t)
 
             # q_lora needed by indexer
             if self.use_dsa:
@@ -370,7 +394,10 @@ class DeepseekMLAForwardMixin:
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
+                _t = _t0()
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                if _pd_timing:
+                    _pd_span("mla_qb_proj_us", _t)
 
                 # Hoist these above the DSA indexer split op so the indexer
                 # and the composite bmm+attention split op are adjacent in FX.
@@ -397,17 +424,63 @@ class DeepseekMLAForwardMixin:
                             self.layer_id, prev_topk_indices
                         )
         else:
-            q = self.q_proj(hidden_states)[0].view(
-                -1, self.num_local_heads, self.qk_head_dim
-            )
-            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+            _t_qproj = _t0()
+            if self.fused_qkv_a_proj_nolora is not None:
+                # One GEMM producing [q_heads | kv_lora+rope]; split by width.
+                _t = _t0()
+                fused_qkv = self.fused_qkv_a_proj_nolora(hidden_states)[0]
+                q_width = self.num_local_heads * self.qk_head_dim
+                q = fused_qkv[..., :q_width].reshape(
+                    -1, self.num_local_heads, self.qk_head_dim
+                )
+                latent_cache = fused_qkv[..., q_width:]
+                if _pd_timing:
+                    _pd_span("mla_qproj_q_us", _t)
+                if _VERIFY_FUSED_QKV and not _fused_qkv_verified[0]:
+                    # One-shot equivalence check against the unfused modules
+                    # (they are still present, just unused). Confirms both the
+                    # loader-built weight and the forward split.
+                    with torch.no_grad():
+                        ref = torch.cat(
+                            [
+                                self.q_proj(hidden_states)[0],
+                                self.kv_a_proj_with_mqa(hidden_states)[0],
+                            ],
+                            dim=-1,
+                        )
+                        _d = (fused_qkv.float() - ref.float()).abs().max().item()
+                    print(
+                        f"[fused-qkv-verify] max|fused-ref|={_d:.3e} "
+                        f"dtype={fused_qkv.dtype}",
+                        flush=True,
+                    )
+                    _fused_qkv_verified[0] = True
+            else:
+                _t = _t0()
+                q = self.q_proj(hidden_states)[0].view(
+                    -1, self.num_local_heads, self.qk_head_dim
+                )
+                if _pd_timing:
+                    _pd_span("mla_qproj_q_us", _t)
+                _t = _t0()
+                latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+                if _pd_timing:
+                    _pd_span("mla_qproj_kv_us", _t)
+            _t = _t0()
             k_nope = latent_cache[..., : self.kv_lora_rank]
             k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+            if _pd_timing:
+                _pd_span("mla_knorm_us", _t)
+                _pd_span("mla_qproj_us", _t_qproj)
 
         if q_nope is None:
+            _t = _t0()
             q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
+            if _pd_timing:
+                _pd_span("mla_split_pe_us", _t)
 
         _kvb_q = None
+        _t_bmm = _t0()
         if fusion_plan is not None:
             # The composite split op fills q_nope_out_buf and attention reads
             # this transposed alias directly.
@@ -513,6 +586,8 @@ class DeepseekMLAForwardMixin:
                 q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
             q_nope_out = q_nope_out.transpose(0, 1)
+            if _pd_timing:
+                _pd_span("mla_qnope_bmm_us", _t_bmm)
             if _SGLANG_EXPERIMENTAL_LORA_OPTI:
                 from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
                     kv_b_lora_q_apply,
@@ -565,6 +640,9 @@ class DeepseekMLAForwardMixin:
                     f"not supported forward_mode {forward_batch.forward_mode}"
                 )
 
+        if _pd_timing:
+            _pd_span("mla_prepare_us", _t_all)
+
         return (
             q_pe,
             k_pe,
@@ -592,6 +670,23 @@ class DeepseekMLAForwardMixin:
         fusion_plan: Optional[MlaBmmFusionPlan] = None,
     ):
         save_kv_cache = True
+
+        # AFD sub-phase timing (SGLANG_AFD_PROFILE_DETAIL=1).
+        try:
+            from sglang.srt.afd.detail_profile import (
+                profile_detail_enabled as _pd_on,
+                record_span as _pd_span,
+            )
+
+            _pd_timing = bool(_pd_on())
+        except Exception:
+            _pd_timing = False
+
+        def _t0() -> float:
+            return time.perf_counter() if _pd_timing else 0.0
+
+        _t_attn = _t0()
+        _t_all = _t0()
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
@@ -777,7 +872,10 @@ class DeepseekMLAForwardMixin:
             attn_output = cp_lse_ag_out_rs(attn_output, lse, get_attention_dcp_group())
             attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+        if _pd_timing:
+            _pd_span("mla_attn_block_us", _t_attn)
 
+        _t_v = _t0()
         _kvb_v = None
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             # Fork the kv_b v-correction A-step onto the LoRA side stream to overlap the bmm.
@@ -943,7 +1041,13 @@ class DeepseekMLAForwardMixin:
             attn_bmm_output = apply_kv_b_lora_v_correction(
                 self, attn_output, attn_bmm_output
             )
+        if _pd_timing:
+            _pd_span("mla_vbmm_us", _t_v)
+        _t = _t0()
         output, _ = self.o_proj(attn_bmm_output)
+        if _pd_timing:
+            _pd_span("mla_oproj_us", _t)
+            _pd_span("mla_core_us", _t_all)
 
         if self.next_skip_topk is None:
             return output

@@ -795,6 +795,18 @@ class ServerArgs:
         bool,
         "Enabling mixing prefill and decode in a batch when using chunked prefill.",
     ] = False
+    enable_decode_token_budget: A[
+        bool,
+        "Sarathi-style decode token budget: each step reserves decode tokens and mixes "
+        "decode with chunked prefill so continuous prefill cannot starve decode. "
+        "Implies mixed chunk when chunked prefill is enabled.",
+    ] = False
+    decode_token_budget_stall_limit: A[
+        int,
+        "With --enable-decode-token-budget, force a decode-only step if running decode "
+        "requests have not been scheduled for this many consecutive steps. "
+        "Set 0 to disable the stall guard. Default: 2.",
+    ] = 2
 
     # -------------------------------------------------------------------------
     # Device info and server timeout
@@ -3037,6 +3049,12 @@ class ServerArgs:
     def _handle_cuda_graph_config(self):
         self._parse_cuda_graph_config()
         self._apply_cuda_graph_compatibility()
+        # AFD (StepMesh) cannot use full decode CUDA Graph — force breakable.
+        from sglang.srt.afd.bootstrap import apply_afd_cuda_graph_policy
+        from sglang.srt.afd.pd_policy import apply_afd_pd_policy
+
+        apply_afd_cuda_graph_policy(self)
+        apply_afd_pd_policy(self)
         self._validate_cuda_graph_config()
 
     def _parse_cuda_graph_config(self):

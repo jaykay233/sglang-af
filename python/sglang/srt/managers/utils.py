@@ -78,6 +78,16 @@ class GenerationBatchResult:
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
 
+    # AFD farm persistent runtime: partial-ready protocol.
+    #
+    # When ``ready_req_pool_indices`` is not None, only those rows produced
+    # output this forward. ``next_token_ids`` / ``logits_output`` are row
+    # aligned with it, and ``deferred_req_pool_indices`` rows must not advance
+    # seq_len, publish, or consume new KV slots this step.
+    ready_req_pool_indices: Optional[torch.Tensor] = None
+    deferred_req_pool_indices: Optional[torch.Tensor] = None
+    ready_seq_lens: Optional[torch.Tensor] = None
+
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
@@ -88,7 +98,13 @@ class GenerationBatchResult:
     @property
     def has_sampled_token_ids(self) -> bool:
         """True when this iter sampled token ids; False when none were produced
-        this rank/split (a non-last PP rank or a non-final prefill split)."""
+        this rank/split (a non-last PP rank or a non-final prefill split).
+
+        For the farm partial-ready protocol, an empty ready set means zero
+        sampled tokens even though ``next_token_ids`` may be an empty tensor.
+        """
+        if self.ready_req_pool_indices is not None:
+            return int(self.ready_req_pool_indices.numel()) > 0
         return isinstance(self.next_token_ids, torch.Tensor)
 
     @torch.profiler.record_function("copy_result_to_cpu")
@@ -97,35 +113,39 @@ class GenerationBatchResult:
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
-        if return_logprob:
-            if self.logits_output.next_token_logprobs is not None:
-                self.logits_output.next_token_logprobs = _async_d2h(
-                    self.logits_output.next_token_logprobs
+        logits_output = self.logits_output
+        if return_logprob and logits_output is not None:
+            if logits_output.next_token_logprobs is not None:
+                logits_output.next_token_logprobs = _async_d2h(
+                    logits_output.next_token_logprobs
                 )
-            if self.logits_output.input_token_logprobs is not None:
-                self.logits_output.input_token_logprobs = _async_d2h(
-                    self.logits_output.input_token_logprobs
+            if logits_output.input_token_logprobs is not None:
+                logits_output.input_token_logprobs = _async_d2h(
+                    logits_output.input_token_logprobs
                 )
-            if self.logits_output.next_token_top_logprobs_val is not None:
-                self.logits_output.next_token_top_logprobs_val = [
+            if logits_output.next_token_top_logprobs_val is not None:
+                logits_output.next_token_top_logprobs_val = [
                     _async_d2h(v) if torch.is_tensor(v) else v
-                    for v in self.logits_output.next_token_top_logprobs_val
+                    for v in logits_output.next_token_top_logprobs_val
                 ]
-            if self.logits_output.next_token_top_logprobs_idx is not None:
-                self.logits_output.next_token_top_logprobs_idx = [
+            if logits_output.next_token_top_logprobs_idx is not None:
+                logits_output.next_token_top_logprobs_idx = [
                     _async_d2h(x) if torch.is_tensor(x) else x
-                    for x in self.logits_output.next_token_top_logprobs_idx
+                    for x in logits_output.next_token_top_logprobs_idx
                 ]
-            if self.logits_output.next_token_token_ids_logprobs_val is not None:
-                self.logits_output.next_token_token_ids_logprobs_val = [
+            if logits_output.next_token_token_ids_logprobs_val is not None:
+                logits_output.next_token_token_ids_logprobs_val = [
                     _async_d2h(v) if torch.is_tensor(v) else v
-                    for v in self.logits_output.next_token_token_ids_logprobs_val
+                    for v in logits_output.next_token_token_ids_logprobs_val
                 ]
-        if return_hidden_states and self.logits_output.hidden_states is not None:
-            self.logits_output.hidden_states = _async_d2h(
-                self.logits_output.hidden_states
-            )
-        self.next_token_ids = _async_d2h(self.next_token_ids)
+        if (
+            return_hidden_states
+            and logits_output is not None
+            and logits_output.hidden_states is not None
+        ):
+            logits_output.hidden_states = _async_d2h(logits_output.hidden_states)
+        if self.next_token_ids is not None:
+            self.next_token_ids = _async_d2h(self.next_token_ids)
 
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)

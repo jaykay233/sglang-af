@@ -40,10 +40,13 @@ class ParallelExecutor(PipelineExecutor):
         run_stage: Callable[[PipelineStage, Any], Any],
     ) -> Any:
         """Execute stages while respecting their declared parallelism type."""
+        world_rank = get_world_rank()
+        # CFG-local rank is only meaningful for CFG-group collectives. Stages that
+        # broadcast on the world process group must key off ``world_rank``.
         if server_args.enable_cfg_parallel:
             rank = get_classifier_free_guidance_rank()
         else:
-            rank = get_world_rank()
+            rank = world_rank
         cfg_group = get_cfg_group()
         group = get_world_group()
 
@@ -72,7 +75,7 @@ class ParallelExecutor(PipelineExecutor):
                     # `dist.broadcast(src=...)` expects a global rank for process groups.
                     broadcasted_list = broadcast_pyobj(
                         obj_list,
-                        rank=get_world_rank(),
+                        rank=world_rank,
                         dist_group=cfg_group.cpu_group,
                         src=cfg_group.ranks[0],
                     )
@@ -99,8 +102,14 @@ class ParallelExecutor(PipelineExecutor):
                         use_nvtx,
                     )
                 elif paradigm == StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS:
+                    # Execute on CFG-main ranks (rank==0). With CFG×SP, that is the
+                    # full sequence-parallel mesh for the positive branch; restricting
+                    # to world_rank==0 deadlocks inside SP collectives.
+                    #
+                    # The following world-group broadcast still uses world_rank/src=0.
+                    # Using CFG-local rank as broadcast_pyobj's ``rank`` previously made
+                    # every CFG-group rank0 enter the sender path and desynced Gloo.
                     if rank == 0:
-                        # Only main rank executes, others just wait
                         batch = self._run_stage_with_executor_hooks(
                             stage,
                             stage_index,
@@ -111,12 +120,15 @@ class ParallelExecutor(PipelineExecutor):
                         )
                     torch.distributed.barrier()
 
-                    # Send batch to other ranks
-                    obj_list = [batch] if rank == 0 else []
+                    # Send batch to other ranks (world process group, global src=0)
+                    obj_list = [batch] if world_rank == 0 else []
                     broadcasted_list = broadcast_pyobj(
-                        obj_list, rank=rank, dist_group=group.cpu_group, src=0
+                        obj_list,
+                        rank=world_rank,
+                        dist_group=group.cpu_group,
+                        src=0,
                     )
-                    if rank != 0:
+                    if world_rank != 0:
                         batch = broadcasted_list[0]
                     torch.distributed.barrier()
         return batch

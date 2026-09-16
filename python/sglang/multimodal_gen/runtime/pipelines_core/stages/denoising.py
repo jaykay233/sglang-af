@@ -28,6 +28,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
+    _transformer_already_cached,
+    clamp_cache_dit_warmup,
     enable_cache_on_dual_transformer,
     enable_cache_on_transformer,
     get_scm_mask,
@@ -381,6 +383,16 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if isinstance(num_inference_steps, tuple):
             num_high_noise_steps, num_low_noise_steps = num_inference_steps
 
+        # Another stage may have already mounted cache-dit on this shared DiT
+        # (e.g. LTX stage-1 before refinement). Adopt it and refresh context.
+        if not self._cache_dit_enabled and self.transformer is not None:
+            primary_cached = _transformer_already_cached(self.transformer)
+            secondary_cached = self.transformer_2 is None or _transformer_already_cached(
+                self.transformer_2
+            )
+            if primary_cached and secondary_cached:
+                self._cache_dit_enabled = True
+
         # NOTE: When a new request arrives, we need to refresh the cache-dit context.
         if self._cache_dit_enabled:
             scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
@@ -483,20 +495,24 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             )
 
         # build config for primary transformer (high-noise expert)
+        primary_steps = (
+            num_inference_steps
+            if isinstance(num_inference_steps, int)
+            else num_high_noise_steps
+        )
+        primary_warmup = clamp_cache_dit_warmup(
+            envs.SGLANG_CACHE_DIT_WARMUP, primary_steps
+        )
         primary_config = CacheDitConfig(
             enabled=True,
             Fn_compute_blocks=envs.SGLANG_CACHE_DIT_FN,
             Bn_compute_blocks=envs.SGLANG_CACHE_DIT_BN,
-            max_warmup_steps=envs.SGLANG_CACHE_DIT_WARMUP,
+            max_warmup_steps=primary_warmup,
             residual_diff_threshold=envs.SGLANG_CACHE_DIT_RDT,
             max_continuous_cached_steps=envs.SGLANG_CACHE_DIT_MC,
             enable_taylorseer=envs.SGLANG_CACHE_DIT_TAYLORSEER,
             taylorseer_order=envs.SGLANG_CACHE_DIT_TS_ORDER,
-            num_inference_steps=(
-                num_inference_steps
-                if isinstance(num_inference_steps, int)
-                else num_high_noise_steps
-            ),
+            num_inference_steps=primary_steps,
             # SCM fields
             steps_computation_mask=steps_computation_mask,
             steps_computation_policy=scm_policy,
@@ -506,11 +522,14 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             # dual transformer
             # build config for secondary transformer (low-noise expert)
             # uses secondary parameters which inherit from primary if not explicitly set
+            secondary_warmup = clamp_cache_dit_warmup(
+                envs.SGLANG_CACHE_DIT_SECONDARY_WARMUP, num_low_noise_steps
+            )
             secondary_config = CacheDitConfig(
                 enabled=True,
                 Fn_compute_blocks=envs.SGLANG_CACHE_DIT_SECONDARY_FN,
                 Bn_compute_blocks=envs.SGLANG_CACHE_DIT_SECONDARY_BN,
-                max_warmup_steps=envs.SGLANG_CACHE_DIT_SECONDARY_WARMUP,
+                max_warmup_steps=secondary_warmup,
                 residual_diff_threshold=envs.SGLANG_CACHE_DIT_SECONDARY_RDT,
                 max_continuous_cached_steps=envs.SGLANG_CACHE_DIT_SECONDARY_MC,
                 enable_taylorseer=envs.SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER,
@@ -539,6 +558,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             )
         else:
             # single transformer
+            already_cached = _transformer_already_cached(self.transformer)
             self.transformer = enable_cache_on_transformer(
                 self.transformer,
                 primary_config,
@@ -553,6 +573,17 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 envs.SGLANG_CACHE_DIT_BN,
                 envs.SGLANG_CACHE_DIT_RDT,
             )
+            if already_cached:
+                scm_preset = None if scm_preset == "none" else scm_preset
+                refresh_context_on_transformer(
+                    self.transformer,
+                    (
+                        num_inference_steps
+                        if isinstance(num_inference_steps, int)
+                        else num_high_noise_steps
+                    ),
+                    scm_preset=scm_preset,
+                )
 
         self._cache_dit_enabled = True
         self._cached_num_steps = num_inference_steps

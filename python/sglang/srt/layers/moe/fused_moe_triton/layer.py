@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
+import time
 from enum import Enum
 from functools import cached_property
 from typing import List, Optional, Tuple
@@ -131,6 +132,23 @@ class FusedMoeWeightScaleSupported(Enum):
     CHANNEL = "channel"
     GROUP = "group"
     BLOCK = "block"
+
+
+def _moe_trace_on() -> bool:
+    """Per-call MoE sub-section timing switch (progress.md §13).
+
+    Lazily imports the triton-runner helper to avoid an import cycle: this
+    module is shared by every MoE runner backend, the helper lives with the
+    triton one.
+    """
+    try:
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+            _moe_trace_enabled,
+        )
+
+        return _moe_trace_enabled()
+    except Exception:
+        return False
 
 
 class FusedMoE(torch.nn.Module):
@@ -1115,13 +1133,27 @@ class FusedMoE(torch.nn.Module):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
+        if _moe_trace_on():
+            from sglang.srt.afd.detail_profile import record_us
+
+            _t = time.perf_counter()
+        else:
+            _t = 0.0
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
 
+        if _t:
+            record_us("moe_disp_us", (time.perf_counter() - _t) * 1e6)
+            _t = time.perf_counter()
+
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
         )
+
+        if _t:
+            _t2 = time.perf_counter()
+            record_us("moe_core_us", (_t2 - _t) * 1e6)
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
@@ -1132,6 +1164,9 @@ class FusedMoE(torch.nn.Module):
             final_hidden_states = final_hidden_states[
                 ..., :origin_hidden_states_dim
             ].contiguous()
+
+        if _t:
+            record_us("moe_comb_us", (time.perf_counter() - _t2) * 1e6)
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -1157,10 +1192,20 @@ class FusedMoE(torch.nn.Module):
 
     def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
         # TODO: consider using symmetric memory
-        return self.quant_method.apply(
+        if not _moe_trace_on():
+            return self.quant_method.apply(
+                layer=self,
+                dispatch_output=dispatch_output,
+            )
+        from sglang.srt.afd.detail_profile import record_us
+
+        _t = time.perf_counter()
+        out = self.quant_method.apply(
             layer=self,
             dispatch_output=dispatch_output,
         )
+        record_us("moe_apply_us", (time.perf_counter() - _t) * 1e6)
+        return out
 
     @classmethod
     def make_expert_params_mapping(

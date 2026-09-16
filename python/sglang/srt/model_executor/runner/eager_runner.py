@@ -61,6 +61,30 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+def _carry_farm_in(caller_batch: Any, executed_batch: Any) -> None:
+    """Carry farm inputs (notably the sampler) into the executed batch.
+
+    ``load_batch`` builds the model's ForwardBatch with ``dataclasses.replace``,
+    so attributes set on the scheduler's batch never reach the model. Without
+    this the persistent farm cannot sample. Imported lazily (and gated on the
+    persistent flag) so non-farm runs never pull in the AFD stack.
+    """
+    if not envs.SGLANG_AFD_FARM_PERSISTENT.get():
+        return
+    from sglang.srt.afd.farm.persistent_runtime import sync_farm_before_forward
+
+    sync_farm_before_forward(caller_batch, executed_batch)
+
+
+def _carry_farm_out(executed_batch: Any, caller_batch: Any) -> None:
+    """Carry the farm result from the executed batch back to the caller's."""
+    if not envs.SGLANG_AFD_FARM_PERSISTENT.get():
+        return
+    from sglang.srt.afd.farm.persistent_runtime import sync_farm_after_forward
+
+    sync_farm_after_forward(executed_batch, caller_batch)
+
+
 class EagerRunner(BaseRunner):
     def __init__(self, model_runner: ModelRunner) -> None:
         super().__init__(model_runner)
@@ -227,8 +251,12 @@ class EagerRunner(BaseRunner):
         model_runner = self.model_runner
         enable_pdmux = model_runner.server_args.enable_pdmux
         attn_backend, pdmux_ctx = self._resolve_decode_pdmux()
+        caller_batch = forward_batch
         if not enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
+        # ``load_batch`` returns a different ForwardBatch; the farm's sampler and
+        # result flags must be carried across explicitly.
+        _carry_farm_in(caller_batch, forward_batch)
         if forward_batch.needs_forward_metadata_init():
             if hasattr(model_runner.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
@@ -245,13 +273,14 @@ class EagerRunner(BaseRunner):
         )
 
         with ctx, pdmux_ctx:
-            return model_runner.model.forward(
+            result = model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
                 **kwargs,
             )
-
+        _carry_farm_out(forward_batch, caller_batch)
+        return result
     def _execute_extend(
         self,
         forward_batch: ForwardBatch,

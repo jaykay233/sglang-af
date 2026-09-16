@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import functools
+import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
@@ -52,6 +53,21 @@ _use_sgl_xpu = use_intel_xpu_backend()
 _is_musa = is_musa()
 
 
+def _moe_trace_enabled() -> bool:
+    """True when the AFD MoE sub-section timers should fire (progress.md §13).
+
+    Reuses the AFD detail-profile switch so the farm harness needs no new flag.
+    """
+    if not get_bool_env_var("SGLANG_AFD_FARM_FFN_SECTION_TIME"):
+        return False
+    try:
+        from sglang.srt.afd.detail_profile import profile_detail_enabled
+
+        return profile_detail_enabled()
+    except Exception:
+        return False
+
+
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
@@ -89,7 +105,21 @@ if not _is_cuda and not _is_hip and not _is_xpu:
 padding_size = get_moe_padding_size(_use_aiter)
 
 
+def _flat2d(x: torch.Tensor) -> torch.Tensor:
+    """Return ``x`` as a 2-D (rows, cols) tensor without a dispatch when possible.
+
+    ``intermediate_cache1`` is already allocated as ``(total_tokens, N)``, so the
+    historical ``intermediate_cache1.view(-1, N)`` was a no-op that still paid a
+    dispatcher call on a CPU-bound path (progress.md §14).
+    """
+    return x if x.dim() == 2 else x.view(-1, x.shape[-1])
+
+
 def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
+    if not envs.SGLANG_AFD_MOE_SUM_REDUCE_COMPILE.get():
+        # progress.md §14: the Dynamo guard evaluation on every call costs far
+        # more than the kernel it guards at farm-sized token counts.
+        return False
     return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
 
 
@@ -250,6 +280,13 @@ def fused_experts(
         moe_runner_config.num_experts is None
         or moe_runner_config.num_experts != moe_runner_config.num_local_experts
     )
+    _trace = _moe_trace_enabled()
+    if _trace:
+        from sglang.srt.afd.detail_profile import record_us
+
+        _t_fx = time.perf_counter()
+    else:
+        _t_fx = 0.0
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
         inplace_fused_experts(
@@ -282,6 +319,8 @@ def fused_experts(
             swiglu_limit=moe_runner_config.swiglu_limit,
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
         )
+        if _t_fx:
+            record_us("moe_fx_us", (time.perf_counter() - _t_fx) * 1e6)
         return hidden_states
     else:
         return outplace_fused_experts(
@@ -387,6 +426,14 @@ def _prepare_fused_moe_run(
         dtype=hidden_states.dtype,
     )
 
+    if _moe_trace_enabled():
+        from sglang.srt.afd.detail_profile import record_us
+
+        _t_cfg = time.perf_counter()
+    else:
+        record_us = None  # type: ignore[assignment]
+        _t_cfg = 0.0
+
     config, (down_config, _) = try_get_optimal_moe_config(
         w1.shape,
         (w2.shape[0], w2.shape[1], w2.shape[2] - padded_size),
@@ -397,6 +444,13 @@ def _prepare_fused_moe_run(
         per_channel_quant=per_channel_quant,
         return_down_config=True,
     )
+
+    if record_us is not None:
+        _t_align = time.perf_counter()
+        record_us("moe_cfgsel_us", (_t_align - _t_cfg) * 1e6)
+    else:
+        _t_align = 0.0
+
     down_moe_use_tma = (
         _down_moe_use_tma()
         and down_config is not None
@@ -406,6 +460,9 @@ def _prepare_fused_moe_run(
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids, config["BLOCK_SIZE_M"], E
     )
+
+    if _t_align:
+        record_us("moe_align_us", (time.perf_counter() - _t_align) * 1e6)
 
     return (
         config,
@@ -468,6 +525,17 @@ def _fused_moe_kernel_sequence(
     topk = topk_ids.shape[1]
     compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
 
+    _trace = _moe_trace_enabled()
+
+    def _mark(name: str, t0: float) -> float:
+        if _trace:
+            from sglang.srt.afd.detail_profile import record_us
+
+            record_us(name, (time.perf_counter() - t0) * 1e6)
+        return time.perf_counter() if _trace else 0.0
+
+    _t = time.perf_counter() if _trace else 0.0
+
     padded_tokens = (
         min(num_tokens * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1)
         if down_moe_use_tma
@@ -501,6 +569,8 @@ def _fused_moe_kernel_sequence(
         dtype=hidden_states.dtype,
     )
 
+    _t = _mark("moe_alloc_us", _t)
+
     invoke_fused_moe_kernel(
         hidden_states,
         w1,
@@ -527,6 +597,8 @@ def _fused_moe_kernel_sequence(
         c_sorted=down_moe_use_tma,
         filter_expert=filter_expert,
     )
+
+    _t = _mark("moe_k1_us", _t)
 
     if hooks and hooks.after_gate_up:
         # Hooks expect intermediate_cache1 shaped (num_tokens, topk, N); the
@@ -555,19 +627,19 @@ def _fused_moe_kernel_sequence(
             assert gemm1_limit is not None
             if gate_up_interleaved:
                 intermediate_cache2 = swiglu_gpt_oss_sigmoid_alpha(
-                    intermediate_cache1.view(-1, N),
+                    _flat2d(intermediate_cache1),
                     gemm1_alpha,
                     gemm1_limit,
                 )
             else:
                 intermediate_cache2 = swiglu_no_interleaved_with_alpha_and_limit(
-                    intermediate_cache1.view(-1, N),
+                    _flat2d(intermediate_cache1),
                     gemm1_alpha,
                     gemm1_limit,
                 )
         elif gemm1_limit is not None:
             intermediate_cache2 = _swiglu_silu_clamp_mul(
-                intermediate_cache1.view(-1, N), gemm1_limit
+                _flat2d(intermediate_cache1), gemm1_limit
             )
         elif swiglu_limit is not None:
             # DeepSeek V4: swiglu clamp before silu_and_mul.
@@ -601,15 +673,15 @@ def _fused_moe_kernel_sequence(
                     from sglang.jit_kernel.dsv4 import silu_and_mul_clamp
 
                     silu_and_mul_clamp(
-                        intermediate_cache1.view(-1, N),
+                        _flat2d(intermediate_cache1),
                         intermediate_cache2,
                         swiglu_limit_for_silu_and_mul_clamp,
                     )
                 else:
-                    silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                    silu_and_mul(_flat2d(intermediate_cache1), intermediate_cache2)
             else:
                 act_and_mul_triton(
-                    intermediate_cache1.view(-1, N),
+                    _flat2d(intermediate_cache1),
                     intermediate_cache2,
                     config,
                     topk_ids,
@@ -623,23 +695,23 @@ def _fused_moe_kernel_sequence(
                 # HIP/XPU fall through to the unfiltered path: the down kernel
                 # zeros filtered rows without reading their input.
                 silu_and_mul(
-                    intermediate_cache1.view(-1, N),
+                    _flat2d(intermediate_cache1),
                     intermediate_cache2,
                     expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
                     expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
                 )
             else:
-                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                silu_and_mul(_flat2d(intermediate_cache1), intermediate_cache2)
         elif _is_musa:
-            intermediate_cache2 = _silu_and_mul_musa(intermediate_cache1.view(-1, N))
+            intermediate_cache2 = _silu_and_mul_musa(_flat2d(intermediate_cache1))
         else:
             if _has_vllm_ops:
                 vllm_ops.silu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
+                    intermediate_cache2, _flat2d(intermediate_cache1)
                 )
             else:
                 # Fallback: native PyTorch silu_and_mul
-                x = intermediate_cache1.view(-1, N)
+                x = _flat2d(intermediate_cache1)
                 d = x.shape[-1] // 2
                 intermediate_cache2.copy_(F.silu(x[..., :d]) * x[..., d:])
     elif activation == "gelu" and is_gated:
@@ -648,32 +720,34 @@ def _fused_moe_kernel_sequence(
         if _is_cuda or _is_hip:
             if filter_expert and _is_cuda:
                 gelu_and_mul(
-                    intermediate_cache1.view(-1, N),
+                    _flat2d(intermediate_cache1),
                     intermediate_cache2,
                     expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
                     expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
                 )
             else:
-                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                gelu_and_mul(_flat2d(intermediate_cache1), intermediate_cache2)
         else:
             if _has_vllm_ops:
                 vllm_ops.gelu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
+                    intermediate_cache2, _flat2d(intermediate_cache1)
                 )
             else:
                 # Fallback: native PyTorch gelu_and_mul
-                x = intermediate_cache1.view(-1, N)
+                x = _flat2d(intermediate_cache1)
                 d = x.shape[-1] // 2
                 intermediate_cache2.copy_(F.gelu(x[..., :d]) * x[..., d:])
     # Activation function without multiplication
     elif activation == "silu" and not is_gated:
-        intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
+        intermediate_cache2 = F.silu(_flat2d(intermediate_cache1))
     elif activation == "gelu" and not is_gated:
-        intermediate_cache2 = F.gelu(intermediate_cache1.view(-1, N))
+        intermediate_cache2 = F.gelu(_flat2d(intermediate_cache1))
     elif activation == "relu2" and not is_gated:
-        intermediate_cache2 = torch.square(F.relu(intermediate_cache1.view(-1, N)))
+        intermediate_cache2 = torch.square(F.relu(_flat2d(intermediate_cache1)))
     else:
         raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
+
+    _t = _mark("moe_act_us", _t)
 
     del intermediate_cache1
 
@@ -729,6 +803,8 @@ def _fused_moe_kernel_sequence(
         fuse_sum_all_reduce=use_fused_moe_sum_all_reduce,
         router_topk=topk,
     )
+
+    _mark("moe_k2_us", _t)
 
     if hooks and hooks.after_down:
         hooks.after_down(
@@ -850,6 +926,9 @@ def fused_experts_impl(
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
         padded_size = 0
 
+    _trace = _moe_trace_enabled()
+    _t_cfg = time.perf_counter() if _trace else 0.0
+
     # Check constraints.
     if use_int4_w4a16:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
@@ -882,6 +961,11 @@ def fused_experts_impl(
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
     )
+
+    if _trace:
+        from sglang.srt.afd.detail_profile import record_us
+
+        record_us("moe_cfg_us", (time.perf_counter() - _t_cfg) * 1e6)
 
     return _fused_moe_kernel_sequence(
         hidden_states,

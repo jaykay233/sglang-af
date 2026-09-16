@@ -824,6 +824,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         self.init_memory_pool(self.pre_model_load_memory)
 
+        # Layer-merge: park interior KV on FFN after MLA pool exists.
+        try:
+            from sglang.srt.afd.merge_kv import maybe_init_merge_kv_from_model_runner
+
+            maybe_init_merge_kv_from_model_runner(self)
+        except Exception as e:
+            logger.warning("AFD merge_kv init after memory pool failed: %s", e)
+
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
         # forwards captured into the graph see the patched pool methods.
@@ -895,6 +903,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
         else:
             self.init_attention_backend()
+
+        try:
+            from sglang.srt.afd.merge_kv import ensure_ffn_attn_bound
+
+            ensure_ffn_attn_bound()
+        except Exception:
+            pass
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         """Capture cuda graphs. Requires init_attention_backends() to have run.
@@ -1575,6 +1590,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 raise ValueError(
                     f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
                 ) from None
+
+        # Attention–FFN Disaggregation: init StepMesh/Fake transport after weights.
+        try:
+            from sglang.srt.afd.bootstrap import maybe_init_afd_from_model_runner
+
+            maybe_init_afd_from_model_runner(self)
+        except Exception as e:
+            from sglang.srt.afd.mode import get_afd_mode
+            from sglang.srt.afd.mode import AfdMode as _AfdMode
+
+            if get_afd_mode() != _AfdMode.NULL:
+                raise
+            logger.debug("AFD bootstrap skipped: %s", e)
 
     def _prepare_moe_topk(self):
         balancer_cls = None

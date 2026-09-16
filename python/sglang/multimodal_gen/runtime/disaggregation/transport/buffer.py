@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 
 import torch
@@ -16,6 +17,54 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _want_cuda_ipc_pool() -> bool:
+    if os.environ.get("DISAGG_CUDA_IPC") == "1":
+        return True
+    protocol = os.environ.get("MOONCAKE_PROTOCOL", "").lower()
+    return protocol in ("nvlink_intra", "nvlink", "cuda_ipc")
+
+
+class _CudaMallocOwner:
+    """Owns a cudaMalloc allocation and exposes the CUDA Array Interface."""
+
+    def __init__(self, nbytes: int, device_index: int):
+        from cuda.bindings import runtime as cudart
+
+        err = cudart.cudaSetDevice(device_index)
+        if isinstance(err, tuple):
+            err = err[0]
+        if err != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"cudaSetDevice failed: {err}")
+        ret = cudart.cudaMalloc(nbytes)
+        err, ptr = ret[0], ret[1]
+        if err != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"cudaMalloc({nbytes}) failed: {err}")
+        self.ptr = int(ptr)
+        self.nbytes = int(nbytes)
+        self.device_index = device_index
+        self.__cuda_array_interface__ = {
+            "data": (self.ptr, False),
+            "shape": (self.nbytes,),
+            "typestr": "|u1",
+            "version": 3,
+        }
+
+    def free(self) -> None:
+        if not self.ptr:
+            return
+        from cuda.bindings import runtime as cudart
+
+        cudart.cudaSetDevice(self.device_index)
+        cudart.cudaFree(self.ptr)
+        self.ptr = 0
+
+    def __del__(self):
+        try:
+            self.free()
+        except Exception:
+            pass
 
 
 @dataclass
@@ -32,6 +81,9 @@ class TransferTensorBuffer:
     """Memory pool for staging tensor payloads between roles.
 
     Wraps a contiguous block of memory (CPU pinned or GPU) with a BuddyAllocator.
+    When CUDA IPC / NVLink transfer is enabled, GPU pools are allocated with
+    ``cudaMalloc`` so ``cudaIpcGetMemHandle`` works (PyTorch caching-allocator
+    blocks are not IPC-exportable).
     """
 
     def __init__(
@@ -45,14 +97,24 @@ class TransferTensorBuffer:
         self._device = device
         self._allocator = BuddyAllocator(pool_size, min_block_size)
         actual_size = self._allocator.pool_size
+        self._cuda_owner: _CudaMallocOwner | None = None
 
         if device == "cpu":
             self._pool = torch.empty(actual_size, dtype=torch.uint8, pin_memory=True)
+            self._pool_ptr = self._pool.data_ptr()
+            pool_location = "pinned CPU"
+        elif _want_cuda_ipc_pool():
+            device_index = int(str(device).split(":")[-1]) if ":" in str(device) else 0
+            self._cuda_owner = _CudaMallocOwner(actual_size, device_index)
+            # Wrap without copying; tensor does not own the allocation.
+            self._pool = torch.as_tensor(self._cuda_owner, device=device)
+            self._pool_ptr = self._cuda_owner.ptr
+            pool_location = f"GPU cudaMalloc ({device}, IPC-exportable)"
         else:
             self._pool = torch.empty(actual_size, dtype=torch.uint8, device=device)
-        self._pool_ptr = self._pool.data_ptr()
+            self._pool_ptr = self._pool.data_ptr()
+            pool_location = f"GPU ({device})"
 
-        pool_location = "pinned CPU" if device == "cpu" else f"GPU ({device})"
         logger.info(
             "TransferTensorBuffer[%s]: allocated %d MiB %s memory "
             "(min_block=%d KiB)",

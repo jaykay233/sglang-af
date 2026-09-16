@@ -249,8 +249,10 @@ class DiffusionTransferManager:
         dest_session_id: str,
         dest_addr: int,
         transfer_size: int,
+        dest_ipc_handle: str | None = None,
+        dest_pool_ptr: int = 0,
     ) -> bool:
-        """Push staged data to a remote peer's buffer via RDMA. Returns True on success."""
+        """Push staged data to a remote peer's buffer via RDMA/IPC. Returns True on success."""
         with self._lock:
             staged = self._staged.get(request_id)
 
@@ -260,6 +262,9 @@ class DiffusionTransferManager:
 
         if staged.slot is None:
             return True
+
+        if dest_ipc_handle and hasattr(self._engine, "note_remote"):
+            self._engine.note_remote(dest_session_id, dest_ipc_handle, dest_pool_ptr)
 
         src_addr = self._buffer.pool_data_ptr + staged.slot.offset
         ret = self._engine.transfer_sync(

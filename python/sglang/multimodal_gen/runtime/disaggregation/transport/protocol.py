@@ -63,6 +63,8 @@ class TransferAllocatedMsg:
     pool_ptr: int = 0
     slot_offset: int = 0
     slot_size: int = 0
+    # Optional CUDA IPC handle (base64) for same-node NVLink/P2P transfers.
+    ipc_handle: str | None = None
 
 
 @dataclass
@@ -72,6 +74,9 @@ class TransferPushMsg:
     dest_session_id: str = ""
     dest_addr: int = 0
     transfer_size: int = 0
+    # Optional CUDA IPC fields (same-node NVLink/P2P).
+    dest_ipc_handle: str | None = None
+    dest_pool_ptr: int = 0
 
 
 @dataclass
@@ -117,6 +122,8 @@ class TransferRegisterMsg:
     work_endpoint: str = ""
     # Pre-allocated receive slots: [{"offset": int, "size": int, "slot_id": int, "addr": int}]
     preallocated_slots: list = field(default_factory=list)
+    # Optional CUDA IPC handle (base64) for the transfer pool.
+    ipc_handle: str | None = None
 
 
 def encode_transfer_msg(msg: Any) -> list[bytes]:

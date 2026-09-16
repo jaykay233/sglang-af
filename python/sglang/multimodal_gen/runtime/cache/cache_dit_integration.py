@@ -38,6 +38,29 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import get_dit_gro
 _original_similarity = None
 
 
+def clamp_cache_dit_warmup(warmup: int, num_inference_steps: int) -> int:
+    """Clamp DBCache warmup so short schedules can still reuse blocks.
+
+    LTX stage-2 refine uses only ~3 distilled steps. With the default warmup
+    of 4, every step stays in warmup and Cache-DiT never caches. Leave at
+    least one post-warmup step when possible.
+    """
+    if num_inference_steps <= 0:
+        return warmup
+    max_useful = max(0, num_inference_steps - 1)
+    if warmup <= max_useful:
+        return warmup
+    clamped = max(1, num_inference_steps // 2) if num_inference_steps >= 2 else 0
+    if clamped != warmup:
+        logger.info(
+            "cache-dit warmup clamped %d -> %d for num_inference_steps=%d",
+            warmup,
+            clamped,
+            num_inference_steps,
+        )
+    return clamped
+
+
 def _patch_cache_dit_similarity():
     from cache_dit.caching.cache_contexts import cache_manager
 
@@ -256,6 +279,33 @@ def _build_custom_block_adapter(
     )
 
 
+def _transformer_already_cached(transformer: torch.nn.Module) -> bool:
+    """Return True if cache-dit has already wrapped this transformer instance."""
+    return bool(getattr(transformer, "_is_cached", False)) or hasattr(
+        transformer, "_context_manager"
+    )
+
+
+def _clear_fake_pipeline_class_cached_flag() -> None:
+    """Clear FakeDiffusionPipeline class-level ``_is_cached``.
+
+    cache-dit sets ``FakeDiffusionPipeline.__class__._is_cached = True`` when
+    mounting the first transformer-only model. That class attribute makes every
+    subsequent FakeDiffusionPipeline look already-cached, so enabling cache-dit
+    on a second DiT (e.g. LTX stage-2 ``transformer_2``) skips context creation
+    and then asserts in ``collect_unified_blocks``.
+    """
+    try:
+        from cache_dit.caching.block_adapters import FakeDiffusionPipeline
+    except ImportError:
+        return
+    if "_is_cached" in FakeDiffusionPipeline.__dict__:
+        try:
+            delattr(FakeDiffusionPipeline, "_is_cached")
+        except Exception:
+            FakeDiffusionPipeline._is_cached = False
+
+
 def enable_cache_on_transformer(
     transformer: torch.nn.Module,
     config: CacheDitConfig,
@@ -277,11 +327,20 @@ def enable_cache_on_transformer(
     if not config.enabled:
         return transformer
 
+    if _transformer_already_cached(transformer):
+        logger.info(
+            "cache-dit already mounted on %s; skipping re-enable", model_name
+        )
+        return transformer
+
     if config.num_inference_steps is None:
         raise ValueError(
             "num_inference_steps is required for transformer-only mode. "
             "Please provide it in CacheDitConfig."
         )
+
+    # Allow a second transformer-only mount after the first FakeDiffusionPipeline.
+    _clear_fake_pipeline_class_cached_flag()
 
     # Prefer the standard path (transformer pre-registered in cache-dit). For
     # models absent from the registry, fall back to a manual BlockAdapter (see

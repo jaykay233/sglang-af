@@ -283,3 +283,9 @@ test/registered/xpu/test_nvidia_nemotron_3_nano.py
 artifacts/
 .claude/scheduled_tasks.lock
 .humanize/
+
+# Raw benchmark result dumps (regenerable; summaries live in progress.md and
+# bench-results/plots/*.md). Keeps the run logs out of the repo.
+bench-results/**/*.json
+bench-results/*.json
+bench-results-budget/*.json

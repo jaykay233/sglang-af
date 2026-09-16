@@ -9,6 +9,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
+import torch
 import zmq
 
 from sglang.multimodal_gen.runtime.disaggregation.dispatch_policy import (
@@ -407,9 +408,23 @@ class DiffusionServer:
 
         tensor_fields, scalar_fields = unpack_tensors(frames, device="cpu")
 
+        # Decoder stages (e.g. LTX2AVDecodingStage) emit THWC numpy frames.
+        # The ZMQ tensor codec round-trips them as torch.Tensors; restore ndarray
+        # so save_outputs takes the numpy THWC path instead of the CTHW torch path.
+        output = tensor_fields.get("output")
+        if isinstance(output, torch.Tensor):
+            output = output.detach().cpu().numpy()
+        elif isinstance(output, list):
+            output = [
+                t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else t
+                for t in output
+            ]
+
+        audio = tensor_fields.get("audio")
+
         output_batch = OutputBatch(
-            output=tensor_fields.get("output"),
-            audio=tensor_fields.get("audio"),
+            output=output,
+            audio=audio,
             audio_sample_rate=scalar_fields.get("audio_sample_rate"),
             error=scalar_fields.get("error"),
         )
@@ -663,6 +678,7 @@ class DiffusionServer:
             "pool_ptr": msg.get("pool_ptr", 0),
             "pool_size": msg.get("pool_size", 0),
             "work_endpoint": work_endpoint,
+            "ipc_handle": msg.get("ipc_handle"),
         }
         prealloc = msg.get("preallocated_slots", [])
         info["free_preallocated_slots"] = list(prealloc)
@@ -670,13 +686,14 @@ class DiffusionServer:
 
         logger.info(
             "DiffusionServer transfer: registered %s[%d] work_endpoint=%s "
-            "session=%s pool_ptr=%#x prealloc=%d",
+            "session=%s pool_ptr=%#x prealloc=%d ipc=%s",
             role,
             idx,
             work_endpoint,
             info["session_id"],
             info["pool_ptr"],
             len(prealloc),
+            "yes" if info.get("ipc_handle") else "no",
         )
 
     def _handle_transfer_staged(self, msg: dict) -> None:
@@ -742,6 +759,8 @@ class DiffusionServer:
             dest_session_id=p2p.receiver_session_id,
             dest_addr=slot_info["addr"],
             transfer_size=p2p.data_size,
+            dest_ipc_handle=receiver_peer_info.get("ipc_handle"),
+            dest_pool_ptr=p2p.receiver_pool_ptr,
         )
         sender_pushes[p2p.sender_instance].send_multipart(encode_transfer_msg(push_msg))
         logger.debug(
@@ -822,11 +841,26 @@ class DiffusionServer:
         p2p.receiver_slot_offset = msg.get("slot_offset", 0)
 
         dest_addr = p2p.receiver_pool_ptr + p2p.receiver_slot_offset
+        # Prefer handle from allocated reply; fall back to registered peer info.
+        ipc_handle = msg.get("ipc_handle")
+        if not ipc_handle:
+            record = self._tracker.get(request_id)
+            if record and record.state in (
+                RequestState.DECODER_RUNNING,
+                RequestState.DECODER_WAITING,
+            ):
+                peer = self._decoder_peers.get(p2p.receiver_instance, {})
+            else:
+                peer = self._denoiser_peers.get(p2p.receiver_instance, {})
+            ipc_handle = peer.get("ipc_handle")
+
         push_msg = TransferPushMsg(
             request_id=request_id,
             dest_session_id=p2p.receiver_session_id,
             dest_addr=dest_addr,
             transfer_size=p2p.data_size,
+            dest_ipc_handle=ipc_handle,
+            dest_pool_ptr=p2p.receiver_pool_ptr,
         )
 
         sender_idx = p2p.sender_instance

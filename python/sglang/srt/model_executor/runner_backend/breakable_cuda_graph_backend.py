@@ -26,6 +26,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -137,6 +138,30 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
             return None
         if torch.is_tensor(output):
             return output[:num_tokens]
+        if isinstance(output, LogitsProcessorOutput):
+            return LogitsProcessorOutput(
+                next_token_logits=(
+                    output.next_token_logits[:num_tokens]
+                    if output.next_token_logits is not None
+                    else None
+                ),
+                hidden_states=(
+                    output.hidden_states[:num_tokens]
+                    if output.hidden_states is not None
+                    else None
+                ),
+                full_logits=(
+                    output.full_logits[:num_tokens]
+                    if output.full_logits is not None
+                    else None
+                ),
+                mm_input_embeds=(
+                    output.mm_input_embeds[:num_tokens]
+                    if output.mm_input_embeds is not None
+                    else None
+                ),
+                customized_info=output.customized_info,
+            )
         if isinstance(output, PPProxyTensors):
             return output[:num_tokens]
         if isinstance(output, tuple):
@@ -157,6 +182,26 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
             )
         if torch.is_tensor(output) and torch.is_tensor(output_buffer):
             output_buffer[:num_tokens].copy_(output[:num_tokens])
+            return
+        if isinstance(output, LogitsProcessorOutput) and isinstance(
+            output_buffer, LogitsProcessorOutput
+        ):
+            for name in (
+                "next_token_logits",
+                "hidden_states",
+                "full_logits",
+                "mm_input_embeds",
+            ):
+                src = getattr(output, name)
+                dst = getattr(output_buffer, name)
+                if src is None and dst is None:
+                    continue
+                if src is None or dst is None:
+                    raise ValueError(
+                        f"BCG LogitsProcessorOutput field {name!r} structure "
+                        f"changed between capture sizes"
+                    )
+                dst[:num_tokens].copy_(src[:num_tokens])
             return
         if isinstance(output, PPProxyTensors) and isinstance(
             output_buffer, PPProxyTensors

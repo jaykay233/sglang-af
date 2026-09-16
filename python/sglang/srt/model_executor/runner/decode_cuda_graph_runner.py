@@ -886,6 +886,35 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._replay_graph_key = self._make_graph_key(
                 self.bs, stream_idx, variant_label
             )
+            try:
+                from sglang.srt.afd.merge_kv import (
+                    merge_kv_enabled,
+                    set_live_publish_forward_batch,
+                    publish_merge_forward_meta,
+                )
+
+                if merge_kv_enabled() and self.bs is not None:
+                    # Prefer raw_bs when available (set on prior full load_batch).
+                    raw_bs = int(getattr(self, "raw_bs", self.bs) or self.bs)
+                    raw_num_token = int(
+                        getattr(self, "raw_num_token", raw_bs) or raw_bs
+                    )
+                    buffers = self.buffers
+                    pub = SimpleNamespace(
+                        batch_size=raw_bs,
+                        seq_lens=buffers.seq_lens[:raw_bs],
+                        seq_lens_sum=int(buffers.seq_lens[:raw_bs].sum().item()),
+                        req_pool_indices=buffers.req_pool_indices[:raw_bs],
+                        out_cache_loc=buffers.out_cache_loc[:raw_num_token],
+                        input_ids=buffers.input_ids[:raw_num_token],
+                        positions=buffers.positions[:raw_num_token],
+                        raw_num_token=raw_num_token,
+                        num_padding=max(0, int(self.bs) - raw_bs),
+                    )
+                    set_live_publish_forward_batch(pub)
+                    publish_merge_forward_meta(pub)
+            except Exception:
+                pass
             return
 
         buffers = self.buffers
@@ -937,17 +966,47 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.attn_backend
+        num_tokens = bs * self.num_tokens_per_bs
         fb_view = build_replay_fb_view(
             forward_batch=forward_batch,
             buffers=buffers,
             bs=bs,
             raw_bs=raw_bs,
-            num_tokens=bs * self.num_tokens_per_bs,
+            num_tokens=num_tokens,
             seq_len_fill_value=self.seq_len_fill_value,
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
         attn_backend.init_forward_metadata_out_graph(fb_view)
+
+        # AFD layer-merge: publish padded decode buffers so FFN sees real
+        # seq_lens/out_cache_loc every step (breakable CG never re-runs model
+        # Python prologue; capture-time FB ints stay frozen at dummies).
+        try:
+            from sglang.srt.afd.merge_kv import (
+                merge_kv_enabled,
+                set_live_publish_forward_batch,
+                publish_merge_forward_meta,
+            )
+
+            if merge_kv_enabled():
+                pub = SimpleNamespace(
+                    # Publish RAW batch only — padded CG slots use req_pool=0 /
+                    # seq_len=1 / out_cache=0 and would corrupt real KV on FFN.
+                    batch_size=raw_bs,
+                    seq_lens=buffers.seq_lens[:raw_bs],
+                    seq_lens_sum=int(buffers.seq_lens[:raw_bs].sum().item()),
+                    req_pool_indices=buffers.req_pool_indices[:raw_bs],
+                    out_cache_loc=buffers.out_cache_loc[:raw_num_token],
+                    input_ids=buffers.input_ids[:raw_num_token],
+                    positions=buffers.positions[:raw_num_token],
+                    raw_num_token=raw_num_token,
+                    num_padding=bs - raw_bs,
+                )
+                set_live_publish_forward_batch(pub)
+                publish_merge_forward_meta(pub)
+        except Exception:
+            pass
 
         # Store fields
         self.raw_bs = raw_bs

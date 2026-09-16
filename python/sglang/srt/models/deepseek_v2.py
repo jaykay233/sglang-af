@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -625,22 +626,29 @@ class DeepseekV2MoE(nn.Module):
             # with fused_shared_experts
             fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
 
-        self.experts = get_moe_impl_class(quant_config)(
-            num_experts=num_experts_for_moe
-            + get_global_server_args().ep_num_redundant_experts,
-            num_fused_shared_experts=self.num_fused_shared_experts,
-            top_k=top_k_for_moe,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
-            layer_id=self.layer_id,
-            quant_config=quant_config,
-            routed_scaling_factor=self.routed_scaling_factor,
-            routing_method_type=getattr(
-                config, "routing_method_type", RoutingMethodType.DeepSeekV3
-            ),
-            swiglu_limit=getattr(config, "swiglu_limit", None),
-            prefix=add_prefix("experts", prefix),
-        )
+        from sglang.srt.afd.module_stubs import AfdExpertsStub, afd_skip_experts
+
+        self._afd_skip_experts = afd_skip_experts(layer_id)
+        if self._afd_skip_experts:
+            # Attn worker (scheme A): gate+topk only; experts run remotely.
+            self.experts = AfdExpertsStub()
+        else:
+            self.experts = get_moe_impl_class(quant_config)(
+                num_experts=num_experts_for_moe
+                + get_global_server_args().ep_num_redundant_experts,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                top_k=top_k_for_moe,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                layer_id=self.layer_id,
+                quant_config=quant_config,
+                routed_scaling_factor=self.routed_scaling_factor,
+                routing_method_type=getattr(
+                    config, "routing_method_type", RoutingMethodType.DeepSeekV3
+                ),
+                swiglu_limit=getattr(config, "swiglu_limit", None),
+                prefix=add_prefix("experts", prefix),
+            )
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             self.topk = HashTopK(
@@ -698,8 +706,10 @@ class DeepseekV2MoE(nn.Module):
         self._shared_expert_tp1 = False
         # Shared experts: skip when fused into MoE kernel (self.num_fused_shared_experts > 0)
         # or when DeepEP fusion is enabled (shared expert is local slot 16 in FusedMoE, no separate MLP).
+        # AFD Attn stubs also skip (experts run remotely).
         if (
-            config.n_shared_experts is not None
+            not self._afd_skip_experts
+            and config.n_shared_experts is not None
             and config.n_shared_experts > 0
             and self.num_fused_shared_experts == 0
             and not _is_deepep_fusion
@@ -869,7 +879,15 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
     ) -> torch.Tensor:
+        from sglang.srt.afd.fake_ep_comm import maybe_simulate_ep_comm
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
+
+        # Fair-compare hook: tax colocated MoE like DeepEP dispatch/combine.
+        maybe_simulate_ep_comm(
+            hidden_states,
+            topk=int(getattr(self.config, "num_experts_per_tok", 1) or 1),
+            hidden_size=int(self.config.hidden_size),
+        )
 
         if should_use_mega_moe(self, hidden_states):
             return forward_mega_moe(
@@ -1647,6 +1665,21 @@ class DeepseekV2AttentionMLA(
                 quant_config=quant_config,
                 prefix=add_prefix("kv_a_proj_with_mqa", prefix),
             )
+            # Optional single-GEMM replacement for the pair above. See
+            # SGLANG_OPT_FUSE_QKV_A_PROJ_NOLORA: the fused weight is the two
+            # checkpoint weights concatenated along the output dim, which the
+            # weight loader builds on load (it detects this module by name).
+            self.fused_qkv_a_proj_nolora = None
+            if attn_tp_size == 1 and quant_config is None and envs.SGLANG_OPT_FUSE_QKV_A_PROJ_NOLORA.get():
+                self.fused_qkv_a_proj_nolora = ReplicatedLinear(
+                    self.hidden_size,
+                    self.num_heads * self.qk_head_dim
+                    + self.kv_lora_rank
+                    + self.qk_rope_head_dim,
+                    bias=False,
+                    quant_config=None,
+                    prefix=add_prefix("fused_qkv_a_proj_nolora", prefix),
+                )
 
         self.skip_topk = None
         self.next_skip_topk = None
@@ -2063,29 +2096,40 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.mla_enable_prefill_cp = mla_enable_prefill_cp
         self.layer_id = layer_id
         self.is_nextn = is_nextn
-        self.self_attn = DeepseekV2AttentionMLA(
-            config=config,
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            qk_nope_head_dim=config.qk_nope_head_dim,
-            qk_rope_head_dim=config.qk_rope_head_dim,
-            v_head_dim=config.v_head_dim,
-            q_lora_rank=(
-                config.q_lora_rank if hasattr(config, "q_lora_rank") else None
-            ),
-            kv_lora_rank=config.kv_lora_rank,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            quant_config=quant_config,
-            layer_id=layer_id,
-            reduce_results=False,
-            prefix=add_prefix("self_attn", prefix),
-            alt_stream=alt_stream,
-            is_nextn=is_nextn,
-            dsa_enable_prefill_cp=dsa_enable_prefill_cp,
-            mla_enable_prefill_cp=mla_enable_prefill_cp,
+
+        from sglang.srt.afd.module_stubs import (
+            AfdMissingModule,
+            afd_skip_dense_mlp,
+            afd_skip_entire_moe,
+            afd_skip_self_attn,
         )
+
+        if afd_skip_self_attn(layer_id=layer_id):
+            self.self_attn = AfdMissingModule("self_attn")
+        else:
+            self.self_attn = DeepseekV2AttentionMLA(
+                config=config,
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                qk_nope_head_dim=config.qk_nope_head_dim,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                v_head_dim=config.v_head_dim,
+                q_lora_rank=(
+                    config.q_lora_rank if hasattr(config, "q_lora_rank") else None
+                ),
+                kv_lora_rank=config.kv_lora_rank,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                quant_config=quant_config,
+                layer_id=layer_id,
+                reduce_results=False,
+                prefix=add_prefix("self_attn", prefix),
+                alt_stream=alt_stream,
+                is_nextn=is_nextn,
+                dsa_enable_prefill_cp=dsa_enable_prefill_cp,
+                mla_enable_prefill_cp=mla_enable_prefill_cp,
+            )
         if not hasattr(config, "q_lora_rank") and envs.SGLANG_USE_AG_AFTER_QLORA.get():
             raise ValueError(
                 "SGLANG_USE_AG_AFTER_QLORA only supports the model with q_lora_rank"
@@ -2104,16 +2148,21 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = DeepseekV2MoE(
-                config=config,
-                quant_config=moe_quant_config_override or quant_config,
-                prefix=add_prefix("mlp", prefix),
-                layer_id=self.layer_id,
-                alt_stream=alt_stream,
-                is_nextn=is_nextn,
-                dsa_enable_prefill_cp=dsa_enable_prefill_cp,
-                mla_enable_prefill_cp=mla_enable_prefill_cp,
-            )
+            if afd_skip_entire_moe():
+                self.mlp = AfdMissingModule("mlp")
+            else:
+                self.mlp = DeepseekV2MoE(
+                    config=config,
+                    quant_config=moe_quant_config_override or quant_config,
+                    prefix=add_prefix("mlp", prefix),
+                    layer_id=self.layer_id,
+                    alt_stream=alt_stream,
+                    is_nextn=is_nextn,
+                    dsa_enable_prefill_cp=dsa_enable_prefill_cp,
+                    mla_enable_prefill_cp=mla_enable_prefill_cp,
+                )
+        elif afd_skip_dense_mlp(layer_id):
+            self.mlp = AfdMissingModule("mlp")
         else:
             if enable_moe_dense_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
@@ -2184,7 +2233,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id % self.config.moe_layer_freq == 0
         )
 
-    def forward(
+    def forward_pre_ffn(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -2195,8 +2244,27 @@ class DeepseekV2DecoderLayer(nn.Module):
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
-    ) -> torch.Tensor:
+    ):
+        """Attn + prepare_mlp (+ scheme-A routing). Does not run MLP / remote FFN.
+
+        Returns ``(hidden_for_a2f, residual, topk_ids, topk_weights, meta)``.
+        """
+        # AFD attn-side sub-phase timing (SGLANG_AFD_PROFILE_DETAIL=1).
+        try:
+            from sglang.srt.afd.detail_profile import (
+                profile_detail_enabled as _pd_on,
+                record_span as _pd_span,
+            )
+
+            _pd_timing = bool(_pd_on())
+        except Exception:
+            _pd_timing = False
+
+        def _pd_t0() -> float:
+            return time.perf_counter() if _pd_timing else 0.0
+
         hidden_states_orig = hidden_states
+        _t = _pd_t0()
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,
@@ -2206,7 +2274,10 @@ class DeepseekV2DecoderLayer(nn.Module):
                 quant_format=getattr(self, "_gfx95_quant_format", ""),
             )
         )
+        if _pd_timing:
+            _pd_span("attn_prep_us", _t)
 
+        _t = _pd_t0()
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -2216,23 +2287,26 @@ class DeepseekV2DecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             prev_topk_indices=prev_topk_indices,
         )
+        if _pd_timing:
+            _pd_span("attn_core_us", _t)
         if isinstance(hidden_states, tuple):
             hidden_states, topk_indices = hidden_states
         else:
             topk_indices = None
         get_attn_tp_context().clear_attn_inputs()
 
+        _t = _pd_t0()
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        if _pd_timing:
+            _pd_span("attn_prepmlp_us", _t)
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
         )
-
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
@@ -2240,25 +2314,41 @@ class DeepseekV2DecoderLayer(nn.Module):
         if isinstance(self.mlp, DeepseekV2MLP):
             gemm_output_zero_allocator = None
 
-        if (
-            isinstance(self.mlp, DeepseekV2MoE)
-            and not self.mlp.experts.moe_runner_config.inplace
-            and not torch.compiler.is_compiling()
-        ):
-            from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
+        topk_ids = None
+        topk_weights = None
+        from sglang.srt.afd.runtime import is_afd_attn
+        from sglang.srt.afd.routing_scheme import is_scheme_a
 
-            _mlp_ctx = moe_output_buffer_ctx(hidden_states_orig)
-        else:
-            _mlp_ctx = nullcontext()
+        _t = _pd_t0()
+        if is_afd_attn() and is_scheme_a() and isinstance(self.mlp, DeepseekV2MoE):
+            from sglang.srt.afd.moe_bridge import attn_compute_routing
 
-        with _mlp_ctx:
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                should_allreduce_fusion,
-                use_reduce_scatter,
-                gemm_output_zero_allocator,
-            )
+            topk_ids, topk_weights = attn_compute_routing(self.mlp, hidden_states)
+        if _pd_timing:
+            _pd_span("attn_route_us", _t)
+
+        meta = {
+            "forward_batch": forward_batch,
+            "should_allreduce_fusion": should_allreduce_fusion,
+            "use_reduce_scatter": use_reduce_scatter,
+            "gemm_output_zero_allocator": gemm_output_zero_allocator,
+            "topk_indices": topk_indices,
+            "hidden_states_orig": hidden_states_orig,
+            "hidden_for_mlp": hidden_states,
+        }
+        return hidden_states, residual, topk_ids, topk_weights, meta
+
+    def forward_post_ffn(
+        self,
+        mlp_out: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        meta: dict,
+    ):
+        """Apply post-MLP residual / communicator path after local or remote FFN."""
+        hidden_states = mlp_out
+        forward_batch = meta["forward_batch"]
+        should_allreduce_fusion = meta["should_allreduce_fusion"]
+        topk_indices = meta["topk_indices"]
 
         if (
             not (self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp)
@@ -2272,6 +2362,86 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
 
         return hidden_states, residual, topk_indices
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+        gemm_output_zero_allocator: BumpAllocator = None,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        hidden_states, residual, topk_ids, topk_weights, meta = self.forward_pre_ffn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            residual=residual,
+            zero_allocator=zero_allocator,
+            gemm_output_zero_allocator=gemm_output_zero_allocator,
+            llama_4_scaling=llama_4_scaling,
+            prev_topk_indices=prev_topk_indices,
+            captured_last_layer_outputs=captured_last_layer_outputs,
+        )
+
+        should_allreduce_fusion = meta["should_allreduce_fusion"]
+        use_reduce_scatter = meta["use_reduce_scatter"]
+        gemm_output_zero_allocator = meta["gemm_output_zero_allocator"]
+        hidden_states_orig = meta["hidden_states_orig"]
+        forward_batch = meta["forward_batch"]
+
+        if (
+            isinstance(self.mlp, DeepseekV2MoE)
+            and getattr(self.mlp.experts, "moe_runner_config", None) is not None
+            and not self.mlp.experts.moe_runner_config.inplace
+            and not torch.compiler.is_compiling()
+        ):
+            from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
+
+            _mlp_ctx = moe_output_buffer_ctx(hidden_states_orig)
+        else:
+            _mlp_ctx = nullcontext()
+
+        with _mlp_ctx:
+            # AFD Attn worker: run FFN remotely via StepMesh / Fake transport.
+            # See sglang.srt.afd.RFC.md. Collocated path unchanged when mode=null.
+            from sglang.srt.afd.attn_bridge import maybe_remote_ffn
+            from sglang.srt.afd.remote_policy import layer_merge_k
+            from sglang.srt.afd.runtime import is_afd_attn
+
+            _afd_out = None
+            _merge_k = layer_merge_k() if is_afd_attn() else 1
+            if is_afd_attn():
+                _afd_out = maybe_remote_ffn(
+                    layer_id=self.layer_id,
+                    hidden_states=hidden_states,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                    is_moe=isinstance(self.mlp, DeepseekV2MoE),
+                    merge_k=_merge_k,
+                    residual=residual if _merge_k > 1 else None,
+                    positions=positions if _merge_k > 1 else None,
+                    forward_batch=forward_batch if _merge_k > 1 else None,
+                )
+            if _afd_out is not None:
+                if isinstance(_afd_out, tuple):
+                    # Layer-merge: FFN already ran postprocess + interior layers.
+                    hidden_states, residual = _afd_out
+                    return hidden_states, residual, meta["topk_indices"]
+                hidden_states = _afd_out
+            else:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    should_allreduce_fusion,
+                    use_reduce_scatter,
+                    gemm_output_zero_allocator,
+                )
+
+        return self.forward_post_ffn(hidden_states, residual, meta)
 
     def op_comm_prepare_attn(
         self,
@@ -2367,7 +2537,16 @@ class DeepseekV2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = (
+        # Skip alt_stream on FFN: merge-mode interior layers need per-layer CUDA
+        # graph, and MLA's alt_stream multi-stream ops break graph capture boundaries.
+        _afd_skip_alt = False
+        try:
+            from sglang.srt.afd.mode import AfdMode as _AfdMode, get_afd_mode as _get_afd_mode
+            _afd_skip_alt = _get_afd_mode() == _AfdMode.FFN
+        except Exception:
+            pass
+
+        self.alt_stream = None if _afd_skip_alt else (
             torch.cuda.Stream()
             if (
                 _is_cuda
@@ -2564,28 +2743,118 @@ class DeepseekV2Model(nn.Module):
         aux_hidden_states = []
         if self.pp_group.is_first_rank:
             topk_indices = None
-        for i in range(normal_start_layer, normal_end_layer):
-            # NOTE: torch dynamo does not support graph break in context manager
-            ctx = (
-                nullcontext()
-                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                else get_global_expert_distribution_recorder().with_current_layer(i)
-            )
-            with ctx:
-                layer = self.layers[i]
-                hidden_states, residual, topk_indices = layer(
-                    positions,
-                    hidden_states,
-                    forward_batch,
-                    residual,
-                    zero_allocator,
-                    gemm_output_zero_allocator,
-                    llama_4_scaling,
-                    prev_topk_indices=topk_indices,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states if i in self.layers_to_capture else None
-                    ),
+
+        # Layer-merge (K layers / RTT): force breakable path; publish FB meta for FFN.
+        _merge_k = 1
+        try:
+            from sglang.srt.afd.remote_policy import apply_layer_merge_env, layer_merge_k
+            from sglang.srt.afd.runtime import is_afd_attn
+
+            _merge_k = apply_layer_merge_env() if is_afd_attn() else 1
+            if _merge_k > 1:
+                from sglang.srt.afd.merge_kv import (
+                    publish_merge_forward_meta,
+                    set_live_publish_forward_batch,
                 )
+
+                # Positions live on ForwardBatch for FFN-side rebuild.
+                try:
+                    forward_batch.positions = positions
+                except Exception:
+                    pass
+                try:
+                    forward_batch.raw_num_token = int(forward_batch.input_ids.shape[0])
+                except Exception:
+                    pass
+                set_live_publish_forward_batch(forward_batch)
+                publish_merge_forward_meta(forward_batch)
+        except Exception:
+            _merge_k = 1
+
+        # Decode farm (P0/P1) before lockstep P7 layer pipeline.
+        _use_afd_farm = False
+        _use_afd_layer_pipe = False
+        if not forward_batch.can_run_tbo and _merge_k <= 1:
+            try:
+                from sglang.srt.afd.farm import afd_farm_enabled, run_farm_layers
+
+                _use_afd_farm = afd_farm_enabled(forward_batch)
+            except Exception:
+                _use_afd_farm = False
+            if not _use_afd_farm:
+                try:
+                    from sglang.srt.afd.layer_pipeline import (
+                        afd_layer_pipeline_enabled,
+                        run_layers_pipelined,
+                    )
+
+                    _use_afd_layer_pipe = afd_layer_pipeline_enabled()
+                except Exception:
+                    _use_afd_layer_pipe = False
+
+        if _use_afd_farm and normal_start_layer < normal_end_layer:
+            farm_layers = self.layers[normal_start_layer:normal_end_layer]
+            context_sampler = getattr(
+                forward_batch, "_afd_farm_context_sampler", None
+            )
+            hidden_states, residual, topk_indices = run_farm_layers(
+                farm_layers,
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                residual=residual,
+                zero_allocator=zero_allocator,
+                gemm_output_zero_allocator=gemm_output_zero_allocator,
+                llama_4_scaling=llama_4_scaling,
+                layers_to_capture=self.layers_to_capture,
+                aux_hidden_states=aux_hidden_states,
+                context_sampler=context_sampler,
+                final_norm=self.norm if context_sampler is not None else None,
+            )
+        elif _use_afd_layer_pipe and normal_start_layer < normal_end_layer:
+            pipe_layers = self.layers[normal_start_layer:normal_end_layer]
+            hidden_states, residual, topk_indices = run_layers_pipelined(
+                pipe_layers,
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                residual=residual,
+                zero_allocator=zero_allocator,
+                gemm_output_zero_allocator=gemm_output_zero_allocator,
+                llama_4_scaling=llama_4_scaling,
+                layers_to_capture=self.layers_to_capture,
+                aux_hidden_states=aux_hidden_states,
+            )
+        else:
+            i = normal_start_layer
+            while i < normal_end_layer:
+                # Merge interiors run entirely on FFN — Decode skips them.
+                if _merge_k > 1 and (i % _merge_k) != 0:
+                    i += 1
+                    continue
+                # NOTE: torch dynamo does not support graph break in context manager
+                ctx = (
+                    nullcontext()
+                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
+                )
+                with ctx:
+                    layer = self.layers[i]
+                    hidden_states, residual, topk_indices = layer(
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        zero_allocator,
+                        gemm_output_zero_allocator,
+                        llama_4_scaling,
+                        prev_topk_indices=topk_indices,
+                        captured_last_layer_outputs=(
+                            aux_hidden_states if i in self.layers_to_capture else None
+                        ),
+                    )
+                # Group start already covered interiors remotely — advance by K.
+                i += _merge_k if _merge_k > 1 else 1
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -2740,6 +3009,37 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         if server_args.disable_shared_experts_fusion:
             return
 
+        # AFD scheme A keeps gate/topk on Attn and experts on FFN. Fusing the
+        # shared MLP into the FFN expert slots removes the separate shared-expert
+        # GEMM on the critical path. This scoped enablement covers the
+        # DeepSeek-V2-Lite unquantized EP1 case used by the AFD comparison.
+        try:
+            from sglang.srt.afd.routing_scheme import is_scheme_a
+            from sglang.srt.afd.runtime import is_afd_enabled
+
+            afd_scheme_a = is_afd_enabled() and is_scheme_a()
+        except Exception:
+            afd_scheme_a = False
+
+        if (
+            afd_scheme_a
+            and self.config.n_routed_experts == 64
+            and self.config.n_shared_experts == 2
+            and self.config.num_experts_per_tok == 6
+            and getattr(self.config, "moe_intermediate_size", None) == 1408
+            and float(self.config.routed_scaling_factor) == 1.0
+            and self.quant_config is None
+            and get_parallel().tp_size == 1
+            and get_parallel().moe_ep_size == 1
+        ):
+            self.num_fused_shared_experts = 2
+            log_info_on_rank0(
+                logger,
+                "AFD scheme A: enabled DeepSeek-V2-Lite shared experts fusion "
+                "(2 shared experts -> MoE slots 64/65).",
+            )
+            return
+
         disable_reason = None
         if server_args.enforce_shared_experts_fusion:
             pass
@@ -2835,10 +3135,36 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
 
+        farm_sample_fn = getattr(forward_batch, "_afd_farm_sample_fn", None)
+        if farm_sample_fn is not None:
+
+            def context_sampler(normalized_hidden, _residual, child_fb):
+                logits_output = self.logits_processor(
+                    child_fb.input_ids,
+                    normalized_hidden,
+                    self.lm_head,
+                    child_fb,
+                    None,
+                )
+                next_token_ids = farm_sample_fn(logits_output, child_fb)
+                return logits_output, next_token_ids
+
+            forward_batch._afd_farm_context_sampler = context_sampler
+
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
+        farm_logits_output = getattr(
+            forward_batch, "_afd_farm_logits_output", None
+        )
+        if farm_logits_output is not None:
+            return farm_logits_output
+        if bool(getattr(forward_batch, "_afd_farm_handled", False)):
+            # Persistent farm: this forward sampled zero tokens. The batch's
+            # hidden states are placeholders for the deferred rows, so running
+            # lm_head on them would produce garbage logits.
+            return None
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states

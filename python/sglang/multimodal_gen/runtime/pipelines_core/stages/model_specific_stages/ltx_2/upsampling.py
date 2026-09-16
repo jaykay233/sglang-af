@@ -1,5 +1,6 @@
 import torch
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -46,6 +47,12 @@ class LTX2LoRASwitchStage(PipelineStage):
         self.pipeline = pipeline
         self.phase = phase
 
+    @property
+    def role_affinity(self) -> RoleType:
+        # Stage-1 LoRA switch runs before denoise (encoder hop).
+        # Stage-2 switch runs after upsample, before refinement (denoiser hop).
+        return RoleType.DENOISER if self.phase == "stage2" else RoleType.ENCODER
+
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         if self.pipeline.should_skip_ltx2_lora_switch_stage():
             batch.extra["ltx2_phase"] = self.phase
@@ -70,6 +77,10 @@ class LTX2UpsampleStage(PipelineStage):
         self.vae = vae
         self.audio_vae = audio_vae
         self.pipeline = pipeline
+
+    @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.DENOISER
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
