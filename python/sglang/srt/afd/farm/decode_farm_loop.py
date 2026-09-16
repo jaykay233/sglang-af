@@ -1095,6 +1095,11 @@ def run_farm_layers(
     _start_next_context()
     queues = scheduler.queues
     topk_store: Dict[Tuple[int, int, int], Dict[int, torch.Tensor]] = defaultdict(dict)
+    # One child ForwardBatch per (seq_lo, seq_hi) window for this forward. A
+    # window walks all 27 layers, so 26 of the per-hop builds are redundant
+    # (§19.6). Cleared implicitly: this dict is local to the forward.
+    _slice_cache: Dict[Tuple[int, int], ForwardBatch] = {}
+    _slice_cache_on = bool(envs.SGLANG_AFD_FARM_SLICE_CACHE.get())
     pending: List[FarmHop] = []
     finished = scheduler.finished_tokens
     sampled_logits_by_seq: Dict[int, Any] = {}
@@ -1331,6 +1336,7 @@ def run_farm_layers(
                     li == n_layers - 1
                     or bool(envs.SGLANG_AFD_FARM_MID_SAMPLING_INFO.get())
                 ),
+                child_cache=_slice_cache if _slice_cache_on else None,
             )
             if sl is None:
                 scheduler.rollback(ticket.ticket_id)

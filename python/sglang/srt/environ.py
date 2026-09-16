@@ -562,6 +562,12 @@ class Envs:
     # other 26 layers this is dead work on the attn critical path (py-spy §19:
     # slice_sampling_info ~11% of farm time). Kept as an escape hatch.
     SGLANG_AFD_FARM_MID_SAMPLING_INFO = EnvBool(False)
+    # One-shot farm: build the child ForwardBatch once per (window, forward) and
+    # reuse it for all 27 layers instead of once per hop. The child is
+    # layer-invariant (progress.md §19.6 item 1: window slice = 11.9% of farm
+    # time). Precedent: the persistent farm already reuses one child across all
+    # layers and forwards (`ctx.child_fb`). 0 restores build-per-hop for A/B.
+    SGLANG_AFD_FARM_SLICE_CACHE = EnvBool(True)
     # P1: reserved for concurrent active batches. Not implemented yet: queue
     # entries are bare indices into one decode forward's tensors, so a second
     # live batch would slice garbage. Concurrent batches also cannot overlap

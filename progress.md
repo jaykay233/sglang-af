@@ -1523,3 +1523,93 @@ ceiling under imbalance was previously suppressed by the poll path itself.
    cannot detect this class of bug.
 4. The §20.4 utilisation KPI is what made the mechanism provable (same hops,
    lower busy fraction). Keep it.
+
+<a id="s22"></a>
+## 22. The overlap lever is already spent; the one-shot window-slice cache
+
+### 22.1 Do not rebuild "true pipelining" as a TPOT lever
+
+§16.4 and §17.3 priced the serial chain at `27 x (attn 1114 + rtt 2297) = 92 ms`
+and put an overlap prize of 30–89 ms on it. **§19.2 retracts that model**, and
+§19.6's own retraction note is easy to miss when reading §17 first:
+
+- The hop is **fully hidden**. Attn posts it, does 2094 us of other work, comes
+  back, and the result has been ready for **1348 us**. Removing the FFN entirely
+  would save nothing. So there is no exposed serial `rtt` to overlap with.
+- The 2297 us is the Attn-side **inter-issue interval**, not latency. Summing it
+  with attn work double-counted the Attn side.
+- §9.4 still holds independently: a token's chain is a data dependency
+  (`attn(L) -> hop(L) -> attn(L+1)`), so overlap across tokens/batches raises
+  **throughput**, it does not shorten one sequence's latency.
+
+And it has been built twice already, both times verified and both times slower:
+
+| attempt | overlap achieved | result |
+|---|---|---|
+| §11 persistent runtime | `layers_peak=4`, `span_peak=26` | **2.8x slower** (44.5 -> 20.7 tok/s) |
+| §12 grouped contexts | 4 contexts at 4 layers, `span_peak=3` | **1.8x slower** than `G=1` |
+
+Both lose for the same reason: splitting a coalesced window into `G` chains
+multiplies *concurrent FFN calls* by `G` while the per-call host dispatch is
+fixed (`f ~ 1.5 ms`, §12.4). Overlap only pays if the thing being overlapped were
+exposed — and §19.2 says it is not.
+
+**Consequence for the roadmap:** the lever is the Attn-side inter-issue interval
+(per-hop host work), not concurrency. An earlier "cross-layer overlap, ~89 ms"
+framing derived from §17.3 must not be used to justify new pipelining work.
+
+### 22.2 Window slice: build the child once per (window, forward)
+
+§19.6 item 1: in the one-shot farm every hop called `slice_decode_window`, which
+rebuilds a child `ForwardBatch` via `filter_batch` — ~13 tensor slices, a ~30-key
+dict, and a full `dataclasses.fields(ForwardBatch)` validation loop. None of it
+depends on the layer, yet a window walks all 27 of them.
+
+Implemented as `_build_child_fb` + a `child_cache` keyed by `(seq_lo, seq_hi)`,
+local to one `run_farm_layers` call, gated by `SGLANG_AFD_FARM_SLICE_CACHE`
+(default 1; `0` restores build-per-hop). Only `hidden_states` / `residual` /
+`positions` are re-sliced per layer, because `residual` can be reallocated
+mid-forward.
+
+This is **not a new assumption**: `_run_persistent` already reuses one child
+(`ctx.child_fb`) across all 27 layers *and across forwards*, and §12 measured that
+path as the fastest farm config. The one-shot path was simply rebuilding a
+structure the persistent path already treats as layer-invariant.
+
+Unit tests: `test/registered/unit/afd/test_afd_farm_slice_cache.py` (5 pass) —
+one build per window, distinct windows distinct children, `child_cache=None`
+preserves the old behaviour, an intermediate hop can never inherit a stale
+`sampling_info`, and views are re-sliced rather than cached.
+
+### 22.3 It pays only at the host-bound operating point
+
+Two configs, 2 reps interleaved (order reversed on rep 2), CG off, 1A1F,
+profiling off:
+
+| config | OFF tok/s | ON tok/s | delta | OFF TPOT | ON TPOT |
+|---|---|---|---|---|---|
+| `MAX_INFLIGHT=2`, conc 8, 32 prompts | 41.34 / 41.62 | 41.99 / 41.25 | **+0.3%** (noise) | 168.3 / 168.7 | 166.4 / 168.9 |
+| `MAX_INFLIGHT=8`, per-layer cap 1, conc 16, 64 prompts | 72.28 / 72.16 | 75.51 / 75.34 | **+4.4%** | 174.8 / 174.1 | 167.2 / 169.2 |
+
+`picks` is **identical** in both arms (10125 at cfg 1, 27000 at cfg 2), so no
+work was skipped — this is recomputation removed, not work deferred.
+
+The split is the same lesson as §16.4/§18/§20.3: at low in-flight credit the farm
+is not host-bound, so trimming host work measures flat; at the §18/§19 operating
+point (`MAX_INFLIGHT=8`, per-layer cap 1 — where §19's fixes also paid) it is
+worth +4.4% / −3.6%. **Any future Attn-host-path A/B must state `MAX_INFLIGHT`
+and the per-layer cap**, or it will report a null result for a real win.
+
+Note the cfg-2 baseline (72 tok/s) is not §19's 103.4 tok/s, so B_STEP / coalesce
+differ from §19's run; the A/B is internally consistent, the absolute level is
+not comparable across sections.
+
+Harness change: `bench_farm_e2e.sh` now honours `SGLANG_AFD_FARM_MAX_INFLIGHT`,
+`SGLANG_AFD_NUM_MB` and `SGLANG_AFD_FARM_MAX_INFLIGHT_PER_LAYER` overrides
+(previously hardcoded to 2/2), which is what made the cfg-2 reproduction possible.
+
+Reproduce: `ATTN_GPU=6 FFN_GPU=7 MODES=sticky NUM_PROMPTS=64 MAX_CONCURRENCY=16
+RANDOM_INPUT_LEN=128 RANDOM_OUTPUT_LEN=192 CONTEXT_LENGTH=4096
+SGLANG_AFD_FARM_MAX_INFLIGHT=8 SGLANG_AFD_NUM_MB=8
+SGLANG_AFD_FARM_MAX_INFLIGHT_PER_LAYER=1 SGLANG_AFD_FARM_SLICE_CACHE=<0|1>
+bash bench_farm_e2e.sh`

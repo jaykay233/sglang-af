@@ -133,40 +133,24 @@ def slice_sampling_info(
     return child
 
 
-def slice_decode_window(
+def _build_child_fb(
     *,
-    hidden_states: torch.Tensor,
-    residual: Optional[torch.Tensor],
-    positions: torch.Tensor,
     forward_batch: ForwardBatch,
+    hidden_states: torch.Tensor,
     seq_idxs: Sequence[int],
-    token_num_per_seq: int,
-    with_sampling_info: bool = True,
-) -> Optional[FarmSlice]:
-    """Slice a *contiguous* seq run ``[seq_lo, seq_hi)`` out of a decode batch.
+    seq_lo: int,
+    seq_hi: int,
+    t0: int,
+    t1: int,
+) -> ForwardBatch:
+    """Build the layer-invariant child batch for one contiguous seq window.
 
-    ``with_sampling_info`` may be set to ``False`` for intermediate farm hops.
-    ``filter_batch`` already yields a child with ``sampling_info=None``; only the
-    hop that finishes a sequence is ever handed to the sampler (see
-    ``_on_output_ready``), so building a sliced ``SamplingBatchInfo`` for the
-    other 26 layers is dead work on the attn critical path.
+    Everything here depends only on the window and the *parent* batch, never on
+    the layer, so the result is reusable for all layers of that window within
+    one forward (see ``slice_decode_window(child_cache=...)``). Deliberately does
+    **not** touch ``sampling_info``: that is the one per-layer-varying part and is
+    attached by the caller only on the hop that reaches the sampler.
     """
-    if not seq_idxs:
-        return None
-    seq_lo = int(seq_idxs[0])
-    seq_hi = int(seq_idxs[-1]) + 1
-    if seq_hi - seq_lo != len(seq_idxs):
-        return None
-    if any(int(seq_idxs[i]) != seq_lo + i for i in range(len(seq_idxs))):
-        return None
-
-    tps = max(1, int(token_num_per_seq))
-    t0 = seq_lo * tps
-    t1 = seq_hi * tps
-    n_tok = int(hidden_states.shape[0])
-    if t0 < 0 or t1 > n_tok or t1 <= t0:
-        return None
-
     from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
     if forward_batch.num_token_non_padded is not None:
@@ -185,18 +169,9 @@ def slice_decode_window(
         end_seq_index=seq_hi,
         out_num_token_non_padded=out_non_padded,
     )
-    child.sampling_info = (
-        slice_sampling_info(
-            getattr(forward_batch, "sampling_info", None),
-            seq_lo=seq_lo,
-            seq_hi=seq_hi,
-        )
-        if with_sampling_info
-        else None
-    )
-    if child.sampling_info is not None:
-        child.temperature = child.sampling_info.temperatures
-        child.top_p = child.sampling_info.top_ps
+    child.sampling_info = None
+    child.temperature = None
+    child.top_p = None
 
     top_logprobs_nums = getattr(forward_batch, "top_logprobs_nums", None)
     child.top_logprobs_nums = (
@@ -220,6 +195,83 @@ def slice_decode_window(
     )
     child._afd_farm_parent_seq_idxs = tuple(int(x) for x in seq_idxs)
     child._afd_farm_parent_token_range = (t0, t1)
+    return child
+
+
+def slice_decode_window(
+    *,
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    seq_idxs: Sequence[int],
+    token_num_per_seq: int,
+    with_sampling_info: bool = True,
+    child_cache: Optional[Dict[Tuple[int, int], ForwardBatch]] = None,
+) -> Optional[FarmSlice]:
+    """Slice a *contiguous* seq run ``[seq_lo, seq_hi)`` out of a decode batch.
+
+    ``with_sampling_info`` may be set to ``False`` for intermediate farm hops.
+    ``filter_batch`` already yields a child with ``sampling_info=None``; only the
+    hop that finishes a sequence is ever handed to the sampler (see
+    ``_on_output_ready``), so building a sliced ``SamplingBatchInfo`` for the
+    other 26 layers is dead work on the attn critical path.
+
+    ``child_cache`` (keyed by ``(seq_lo, seq_hi)``) makes the child batch built
+    **once per window per forward** instead of once per hop. In the one-shot farm
+    a window walks 27 layers, and its child is layer-invariant, so 26 of those
+    builds are redundant. The persistent farm already reuses one child across all
+    layers (``ctx.child_fb``), which is what makes this safe rather than novel.
+    Only ``hidden_states`` / ``residual`` / ``positions`` are re-sliced per layer,
+    because ``residual`` can be reallocated mid-forward.
+    """
+    if not seq_idxs:
+        return None
+    seq_lo = int(seq_idxs[0])
+    seq_hi = int(seq_idxs[-1]) + 1
+    if seq_hi - seq_lo != len(seq_idxs):
+        return None
+    if any(int(seq_idxs[i]) != seq_lo + i for i in range(len(seq_idxs))):
+        return None
+
+    tps = max(1, int(token_num_per_seq))
+    t0 = seq_lo * tps
+    t1 = seq_hi * tps
+    n_tok = int(hidden_states.shape[0])
+    if t0 < 0 or t1 > n_tok or t1 <= t0:
+        return None
+
+    key = (seq_lo, seq_hi)
+    child = child_cache.get(key) if child_cache is not None else None
+    if child is None:
+        child = _build_child_fb(
+            forward_batch=forward_batch,
+            hidden_states=hidden_states,
+            seq_idxs=seq_idxs,
+            seq_lo=seq_lo,
+            seq_hi=seq_hi,
+            t0=t0,
+            t1=t1,
+        )
+        if child_cache is not None:
+            child_cache[key] = child
+
+    if with_sampling_info:
+        child.sampling_info = slice_sampling_info(
+            getattr(forward_batch, "sampling_info", None),
+            seq_lo=seq_lo,
+            seq_hi=seq_hi,
+        )
+        if child.sampling_info is not None:
+            child.temperature = child.sampling_info.temperatures
+            child.top_p = child.sampling_info.top_ps
+    elif child.sampling_info is not None:
+        # Cache hit after a final hop (or a reused window): drop the sampler
+        # payload so an intermediate hop can never sample.
+        child.sampling_info = None
+        child.temperature = None
+        child.top_p = None
+
     res = residual[t0:t1] if residual is not None else None
     pos = positions[t0:t1] if positions.shape[0] == n_tok else positions
     return FarmSlice(

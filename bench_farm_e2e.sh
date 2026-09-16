@@ -102,8 +102,11 @@ apply_mode_env() {
   export SGLANG_AFD_FARM=1
   export SGLANG_AFD_FARM_B_STEP="$B_STEP"
   export SGLANG_AFD_FARM_B_WIN_K="$B_WIN_K"
-  export SGLANG_AFD_FARM_MAX_INFLIGHT=2
-  export SGLANG_AFD_NUM_MB=2
+  # Overridable so A/Bs can reproduce the progress.md §18/§19 operating point
+  # (MAX_INFLIGHT=8, per-layer cap 1). Defaults keep the legacy behaviour.
+  export SGLANG_AFD_FARM_MAX_INFLIGHT="${SGLANG_AFD_FARM_MAX_INFLIGHT:-2}"
+  export SGLANG_AFD_NUM_MB="${SGLANG_AFD_NUM_MB:-2}"
+  export SGLANG_AFD_FARM_MAX_INFLIGHT_PER_LAYER="${SGLANG_AFD_FARM_MAX_INFLIGHT_PER_LAYER:-0}"
   # Prefill A2F pad ≥ max hop tokens; with FFN_CG=0 Lite cost is MiB-scale.
   export SGLANG_AFD_MAX_NUM_TOKEN="${SGLANG_AFD_MAX_NUM_TOKEN:-256}"
   export SGLANG_AFD_FARM_LOG_EVERY=32
