@@ -2047,3 +2047,120 @@ SGLANG_AFD_FARM_MAX_INFLIGHT_PER_LAYER=1 SGLANG_AFD_FARM_SLICE_CACHE=1
 SGLANG_AFD_FARM_NUM_CONTEXTS=<1|2> STICKY_COALESCE_K=<1|2|4>
 bash bench_farm_e2e.sh` (`STICKY_COALESCE_K` overrides `COALESCE_K` in the
 sticky mode; both are read at farm startup and echoed in the FFN log).
+
+## 27. Correctness: a real cross-sequence leak in the AFD split path (open)
+
+While generalising §26's hop-width win, a correctness probe (`parity_e2e.py`,
+new) found output corruption at concurrency. This section records what is
+established, what is **ruled out**, the method corrections forced along the way,
+and the environment blocker that stopped the investigation. **No perf result in
+§19–§26 is invalidated**: both the `base` (ctx2 K1) and candidate (ctx1 K2)
+configurations are affected, so this predates the hop-width change.
+
+### 27.1 The leak, stated precisely
+
+The probe sends 16 greedy prompts at concurrency 16 and compares runs. Greedy
+output is a function of the prompt, so two *different* prompts producing the
+*identical* 32-token string is a leak.
+
+- **AFD, conc=16**: 8 of 19 recorded runs contain such a duplicate pair, and the
+  pair is essentially always the same: **`(row 0, row 9)`** (7x), once
+  `(row 0, row 5)`. Row 9's prompt asks for the first five primes; the leaked
+  text is `1, 2, 3, 4, 5, 6, 7, 8, 9, 10,` — **verbatim row 0's answer** to
+  "list the numbers 1 to 20".
+- **Plain SGLang, no AFD**: the same row-9 prompt is correct in **all 6** runs
+  (conc=1 and conc=16), and across 4 runs there are **zero** within-run duplicate
+  pairs.
+
+So the leak is real, AFD-specific, and its **source is always row 0** — the first
+hop to occupy a slot. That fingerprint is consistent with a per-request
+index/slot falling back to a default of 0, not with a static row offset.
+
+### 27.2 Method correction: the "vs conc=1 oracle" rate is confounded
+
+The obvious test — compare a conc=16 run against a conc=1 oracle of the same
+prompts — **overstates the damage**, because batching itself is not
+bit-reproducible upstream of AFD:
+
+| plain (no AFD), conc=16 | result |
+|---|---|
+| conc=1 vs conc=16 (same server) | 13–14 / 16 |
+| conc=16 self-consistency | 15, 16, 15 / 16 |
+| within-run duplicate outputs | **0** (4 runs) |
+
+Its divergences are all "same prompt, different plausible continuation" — no
+cross-row match. So an exact-match test against a single oracle run can fail for
+a perfectly correct server. **The trustworthy discriminator is the within-run
+duplicate pair** (two different prompts → identical text), which plain never
+produces and AFD does. All the "x/16 vs oracle" numbers below are kept for the
+record but carry that caveat; the duplicate-pair canary is the load-bearing one.
+
+### 27.3 Ruled out (each by a direct A/B)
+
+Trigger is **concurrency + unequal input lengths**. At decode every sequence
+contributes exactly one token, so the batch is uniform; unequal lengths only
+exist at prefill. `ignore_eos` (equal finish times) still reproduces it, so it is
+admission-time, not mid-flight batch shrink.
+
+| hypothesis | arm | outcome |
+|---|---|---|
+| farm / persistent runtime | `SGLANG_AFD_FARM=0` (lockstep) | **still leaks**; wrong idx `[3,8..15]`, identical to farm-on |
+| `num_contexts` / owner split | `ctx1_b16` (single 16-row owner) | still wrong (56% vs oracle), different idx |
+| `B_STEP` micro-batch boundary | `B_STEP=16` (single sub-batch) | wrong idx `[3,8..15]`, identical to `B_STEP=8` |
+| radix / prefix cache | `--disable-radix-cache` | still leaks; two runs give the *same* wrong set |
+| batched ragged prefill | `--prefill-max-requests 1` | still leaks (`row0 == row9` in one of three) |
+| A2F stale pad (§19.2) | `SGLANG_AFD_A2F_ZERO_PAD=1` A/B | no effect; 2 leaks in both arms. Diagnostic reverted |
+| upstream SGLang | plain monolithic server | no leak signature |
+
+`afd/` was added wholesale in `934933b592` (no earlier AFD to bisect against),
+and neither `farm/README.md` nor `RFC.md` documents a correctness limitation, so
+this is an **undocumented, pre-existing** bug.
+
+### 27.4 Leading hypothesis, not yet confirmed: slot reuse (`NUM_MB`)
+
+The only mechanism shared by the farm path and `farm0` is the A2F/F2A **slot
+pool**. Preliminary sweep (before the environment failed):
+
+| `NUM_MB` | runs | leak pairs |
+|---|---|---|
+| 1 | 2 | **0** |
+| 2 | 1 | **0** |
+| 8 | 0 | — (all earlier leak observations were at 8) |
+
+This is suggestive but **not established** — the confirming sweep was cut short
+(§27.5). Note the transport's generation check is sound on inspection
+(`push_pull` allocates a monotonic `hid`; `respond` writes `done[mb]=hid`; `wait`
+spins until `done[mb]==hid`), so a stale-F2A explanation would have to come from
+elsewhere — e.g. cross-GPU visibility of `fill_a2f`'s direct write into shared
+IPC memory versus the `a2f_ready` event, or the deferred `AfdHandle(id=-1-mb)`
+path (not taken here: `USE_WAIT_FLAG=0`, `PIPELINE=0`).
+
+### 27.5 Environment blocker (paused here)
+
+The confirming sweep could not run: `/data/share/models` is an **NFS** mount and
+NFS hung. `bench_farm_e2e.sh` sits in **D state** in `nfs3_proc_getattr`; every
+server launch blocks reading weights off NFS. Observed: load average **287**,
+**244** D-state processes (242 stuck `runc init`), `/tmp` at 94%.
+
+This also **explains two earlier "failures" that must not be read as config
+evidence**: parity15's `mb2_b` "FAIL bring-up" and `mb8_a`'s 68-minute hang were
+the NFS outage, not `NUM_MB`. The `NUM_MB>=4` hypothesis therefore rests only on
+"all historical leaks happened at 8", which is weak on its own.
+
+### 27.6 State of the tree
+
+- `bench_farm_e2e.sh`: added an `EXTRA_SERVER_ARGS` passthrough (needed for the
+  prefill/radix arms; harmless otherwise). Kept.
+- `python/sglang/srt/afd/parity_e2e.py`: the probe. New file. Kept.
+- `SGLANG_AFD_A2F_ZERO_PAD` (in `buffers.py` + `environ.py`): A/B measured
+  **null**, so it was reverted, per §24's rule.
+
+### 27.7 Next step when NFS recovers
+
+Re-run the `NUM_MB` sweep (1/2/4/8, 3 reps, per-arm timeout + retry). If only
+`NUM_MB>=4` leaks, instrument the `respond`/`get_batch` generation handshake and
+`fill_a2f`'s cross-GPU visibility; the "source is always row 0" fingerprint
+predicts the corrupting write is the *first* hop's, so log per-`mb_id`
+`handler`/`hid` around the recycle point. Longer term this gates flipping the
+default to `num_contexts=1 + COALESCE_K=2` (§26), even though that config's
+throughput win is unaffected.

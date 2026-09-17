@@ -53,6 +53,13 @@ if [[ -n "${ATTN_BACKEND:-}" ]]; then
   COMMON_ARGS+=(--attention-backend "$ATTN_BACKEND")
 fi
 
+# Extra server flags for ad-hoc A/B arms (e.g. EXTRA_SERVER_ARGS=--disable-radix-cache
+# to isolate a prefix/KV-cache interaction). Word-split on purpose.
+if [[ -n "${EXTRA_SERVER_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  COMMON_ARGS+=(${EXTRA_SERVER_ARGS})
+fi
+
 # --sleep-on-idle parks the FFN scheduler's event_loop_overlap in a zmq poll
 # with the GIL released. Without it the FFN MainThread spins the WAR barrier
 # (torch.cuda.Stream.wait_stream) every iteration and starves the
@@ -108,7 +115,9 @@ apply_mode_env() {
   export SGLANG_AFD_USE_WAIT_FLAG=0
   export SGLANG_AFD_FFN_CUDA_GRAPH=0
   export TORCHDYNAMO_DISABLE=1 TORCH_COMPILE_DISABLE=1
-  export SGLANG_AFD_FARM=1
+  # Overridable so the no-farm lockstep path can be used as a correctness
+  # reference for the same attn+ffn topology (SGLANG_AFD_FARM=0).
+  export SGLANG_AFD_FARM="${SGLANG_AFD_FARM:-1}"
   export SGLANG_AFD_FARM_B_STEP="$B_STEP"
   export SGLANG_AFD_FARM_B_WIN_K="$B_WIN_K"
   # Overridable so A/Bs can reproduce the progress.md §18/§19 operating point
@@ -310,11 +319,33 @@ for mode in "${MODE_ARR[@]}"; do
   [[ -n "$mode" ]] || continue
   cleanup_mode "$mode" || true
   start_af_farm "$mode" "$offset" || { echo "FAIL bring-up $mode" >&2; exit 1; }
-  run_bench "$mode" || { echo "FAIL bench $mode" >&2; exit 1; }
+  if [[ -n "${PARITY_OUT:-}" ]]; then
+    # Correctness probe instead of the throughput bench. Batching changes
+    # (hop width / num_contexts / COALESCE_K) must not change which token a
+    # sequence produces; a structural slice bug only shows up in the text.
+    # Same launch path and knobs as the bench, so the probe measures exactly
+    # the config under test.
+    port=$(cat "$OUT_DIR/$mode.attn_port")
+    python3 -m sglang.srt.afd.parity_e2e \
+      --base-url "http://127.0.0.1:$port" \
+      --model "$MODEL" \
+      --num-prompts "${PARITY_PROMPTS:-16}" \
+      --concurrency "${PARITY_CONCURRENCY:-16}" \
+      --max-tokens "${PARITY_MAX_TOKENS:-32}" \
+      --warmup "${PARITY_WARMUP:-0}" \
+      ${PARITY_HOMOGENEOUS:+--homogeneous} \
+      ${PARITY_VARY_INPUT_LEN:+--vary-input-len} \
+      ${PARITY_IGNORE_EOS:+--ignore-eos} \
+      --out "$PARITY_OUT" || { echo "FAIL parity $mode" >&2; exit 1; }
+  else
+    run_bench "$mode" || { echo "FAIL bench $mode" >&2; exit 1; }
+  fi
   cleanup_mode "$mode"
   offset=$((offset + 10))
   sleep 3
 done
 
-summarize
+if [[ -z "${PARITY_OUT:-}" ]]; then
+  summarize
+fi
 echo "AFD_FARM_E2E_OK"
