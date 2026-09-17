@@ -1715,3 +1715,80 @@ SGLANG_AFD_FARM_MAX_INFLIGHT=8 SGLANG_AFD_NUM_MB=8
 SGLANG_AFD_FARM_MAX_INFLIGHT_PER_LAYER=1 SGLANG_AFD_FARM_SLICE_CACHE=<0|1>
 bash bench_farm_e2e.sh` — with `SGLANG_IDLE_HOUSEKEEPING_INTERVAL_MS` and
 `SGLANG_AFD_FFN_SLEEP_ON_IDLE` left at their new defaults.
+
+### 23.6 Next lever flagged: the FFN F2A output pad
+
+With the harness fixed, attention turns back to the hop. §23's clean timeline run
+put `ffn_compute_us` at 2.66 ms p50 — 77% of the 3.45 ms round trip, with Attn
+spending only 71 us between the FFN reply and re-entering the wait. So the FFN
+hop, not the Attn host path, sets the pace, and arithmetic on it gives
+`317 hops/s * 2.66 ms ≈ 84%` FFN occupancy.
+
+Profiling the FFN process for where that 2.66 ms goes showed the F2A output path
+allocating a full `max_num_token` (256) row slot per hop, writing only ~7 live
+rows, zeroing the rest and handing the whole slot to `respond` to copy — ~42x the
+live bytes. That is the §24 candidate.
+
+> **Resolved in §24: real waste, but not a lever. Measured null (ranges overlap),
+> reverted.**
+
+## 24. FFN output padding is real waste but not a lever (reverted)
+
+§23.6 flagged the FFN F2A output path as the next candidate: `_pack_group_outputs`
+/ `run_same_layer_fused` allocated `torch.empty(max_num_token, H)`, wrote `t`
+live rows, `zero_()`d the `max_num_token - t` pad, and returned it; `respond`
+then copied the whole `max_num_token` slot across. At the §23.5 operating point
+a hop is ~7 rows against a 256-row slot, i.e. ~36x the live bytes.
+
+### 24.1 The change
+
+`_emit_f2a` writes `slot[:t]` into the batch's exported `_f2a_bufs[index]` and
+returns that view. `respond` already short-circuits on
+`dst.data_ptr() == src.data_ptr()`, so the whole-slot copy disappears; the pad is
+left stale, which is safe because consumers read `[:num_tokens]` only — the same
+argument that let `fill_a2f` stop zeroing its pad (§19.2). Gated by
+`SGLANG_AFD_FFN_F2A_SLOT` so the old allocate-and-copy path stays A/B-able
+(`=0` reproduces it exactly). 8 unit tests pinned the aliasing contract and the
+fallback. Verified live, not just in unit tests — a one-shot probe in the taken
+branch logged `F2A_SLOT_TAKEN t=7 slot_shape=(256, 2048)` from a real farm run,
+so the A/B below exercised the new path rather than silently falling back.
+
+### 24.2 Result: null, and the ceiling says it had to be
+
+| arm | tok/s | med TPOT ms |
+|---|---|---|
+| `F2A_SLOT=0` | 103.37 / 101.92 | 124.1 / 125.8 |
+| `F2A_SLOT=1` | 100.21 / 102.08 | 128.7 / 125.1 |
+| **delta** | **−1.5%** | **+1.6%** |
+
+Ranges overlap; this is a null, not a regression. **Reverted** (`ffn_compute.py`
+and `environ.py` restored, test deleted) — a change with no measured upside
+should not add an env var and a code path.
+
+The arithmetic that predicted it, and the reason not to retry:
+
+- The slot is `(256, 2048)` — `hidden_size=2048`, not 7168. Whole slot is
+  `256*2048*2 B ≈ 1.0 MB`; a 7-row hop is `≈ 28 KB`. On a ~2 TB/s part the copy
+  being removed is `≈ 0.5 us`.
+- The hop it sits in is `2660 us` (§23). Ceiling `≈ 0.02%`, i.e. two orders of
+  magnitude below the measurement noise this harness can resolve.
+- Per hop the change removes 1 alloc + 1 pad-wide `zero_()` + replaces a 256-row
+  copy with a 7-row copy: ~2 kernel launches saved. That the result is *neutral*
+  is itself the finding — **the 2.66 ms hop is not host-launch-bound on the F2A
+  output path**, so the FFN's cost is genuine MoE GPU compute, consistent with
+  §23's 84% occupancy.
+
+### 24.3 Scope note for the "padding waste" framing
+
+The 42x figure that motivated this (§23.6) was a *ratio* on a path with a tiny
+absolute denominator. It is worth restating as a rule: multiply the ratio by the
+absolute bytes before ranking it. On the A2F input side the same ratio argument
+is still open (there `max_num_token` padding interacts with routing/GEMM shapes,
+not just a copy), but the F2A output side is now measured dead.
+
+Reproduce: `ATTN_GPU=6 FFN_GPU=7 MODES=sticky NUM_PROMPTS=64 MAX_CONCURRENCY=16
+RANDOM_INPUT_LEN=128 RANDOM_OUTPUT_LEN=192 CONTEXT_LENGTH=4096
+SGLANG_AFD_FARM_MAX_INFLIGHT=8 SGLANG_AFD_NUM_MB=8
+SGLANG_AFD_FARM_MAX_INFLIGHT_PER_LAYER=1 bash bench_farm_e2e.sh` with
+`SGLANG_AFD_FFN_F2A_SLOT` applied per arm (the knob no longer exists in tree;
+re-apply §24.1 to reproduce).
