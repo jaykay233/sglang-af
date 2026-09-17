@@ -1731,6 +1731,14 @@ live bytes. That is the §24 candidate.
 
 > **Resolved in §24: real waste, but not a lever. Measured null (ranges overlap),
 > reverted.**
+>
+> **⚠ Superseded by §25.** Every number in this subsection — the 2.66 ms
+> `ffn_compute_us`, the 71 us `respond_to_wait_enter_us`, and the
+> `317 hops/s * 2.66 ms ≈ 84%` occupancy — was measured on the GIL-starved
+> harness. §25 re-measures on the corrected baseline: the FFN computes in
+> **746 us**, Attn returns to the wait in **1416 us**, and FFN occupancy is
+> **~19–31%**. The conclusion "the FFN hop, not the Attn host path, sets the
+> pace" is **reversed** — Attn is the pace-setter. Read §25 before acting here.
 
 ## 24. FFN output padding is real waste but not a lever (reverted)
 
@@ -1774,9 +1782,10 @@ The arithmetic that predicted it, and the reason not to retry:
   magnitude below the measurement noise this harness can resolve.
 - Per hop the change removes 1 alloc + 1 pad-wide `zero_()` + replaces a 256-row
   copy with a 7-row copy: ~2 kernel launches saved. That the result is *neutral*
-  is itself the finding — **the 2.66 ms hop is not host-launch-bound on the F2A
-  output path**, so the FFN's cost is genuine MoE GPU compute, consistent with
-  §23's 84% occupancy.
+  is itself the finding — **the hop is not host-launch-bound on the F2A output
+  path**, so the FFN's cost is genuine MoE GPU compute. (The parenthetical
+  "consistent with §23's 84% occupancy" is void; §25 corrects occupancy to
+  ~19–31%. The null result itself does not depend on it.)
 
 ### 24.3 Scope note for the "padding waste" framing
 
@@ -1792,3 +1801,145 @@ SGLANG_AFD_FARM_MAX_INFLIGHT=8 SGLANG_AFD_NUM_MB=8
 SGLANG_AFD_FARM_MAX_INFLIGHT_PER_LAYER=1 bash bench_farm_e2e.sh` with
 `SGLANG_AFD_FFN_F2A_SLOT` applied per arm (the knob no longer exists in tree;
 re-apply §24.1 to reproduce).
+
+## 25. Re-measured timeline: the decomposition inverts, FFN was never the bottleneck
+
+§23.6's "FFN sets the pace" and the `84%` occupancy behind §24's ceiling both
+came from the **GIL-starved** harness: §23.1's clean timeline (`ffn_compute_us`
+2.66 ms, Attn back at the wait in 71 us) was taken *before* §23.2 applied the
+throttle + `--sleep-on-idle`. Since §23.2 moved cfg-2 from ~72 to ~102 tok/s,
+every conclusion drawn from that snapshot had to be re-derived before ranking
+further levers.
+
+### 25.1 Method
+
+Same operating point as §23.5 (`SLICE_CACHE=1`, cfg-2), `SGLANG_AFD_TIMELINE=1`
+only for the first arm; a second arm adds `SGLANG_AFD_PROFILE_DETAIL=1` for FFN
+sub-phase attribution (it costs throughput — 92.5 → 53.8 tok/s — so it is used
+for attribution, never for tok/s). Note the timeline is a **ring buffer**, so
+`AFD_RT_TIMELINE n=` is the ring size, not the hop count; hop counts below come
+from the farm's own `picks` counter and from `AFD_TIMELINE layer=` log lines.
+
+### 25.2 The hop decomposition, before and after the harness fix
+
+| phase (p50, us) | §23.1 starved | §25 fixed |
+|---|---|---|
+| `post_to_ffn_us` | ~15 | 15 |
+| `ffn_compute_us` | **2660** | **746** |
+| `ffn_to_respond_us` | ~16 | 16 |
+| `respond_to_wait_enter_us` | **71** | **1416** |
+| `wait_enter_to_done_us` | ~20 | 20 |
+| `total_rt_us` | ~3450 | **2218** |
+
+The two dominant phases **swap places**. Fixing the GIL cut the FFN's per-hop
+compute 3.6x, and Attn's "time to get back to the wait" rose 20x. Post-fix
+`share: fixed=79% compute=21%` (detail arm) and `verdict: MERGE_HANDSHAKE`.
+
+Read carefully, this says the opposite of §23.6: Attn takes 1416 us to return to
+a wait whose result is already there, so the FFN's 746 us is **hidden inside
+Attn's own per-hop work**. FFN sub-phases agree — `a2f_sync_us` p50 = 3 us (no
+wait for A2F), `compute_wall_us` 621 us, `compute_cuda_us` 721 us,
+`respond_us` 64 us: the hop is ~0.8 ms of mostly GPU time and one FFN worker
+serves 1 hop at a time.
+
+### 25.3 `84%` is retracted: FFN occupancy is ~31%
+
+`mean_tok/launch = 6.0` (B_step=8, coalesce_k=1), so needed hops =
+`tokens * 27 / tok_per_launch`:
+
+- clean arm: `5973 * 27 / 6.0 ≈ 26880` hops (farm `picks` 27000, `AFD_TIMELINE`
+  lines 27243 — all three agree). FFN busy `= 27000 * 0.746 ms = 20.1 s`. Decode
+  window `= 5973 / 92.54 = 64.5 s` → **31%**.
+- detail arm: 28625 computes, `compute_cuda_us` p50 = 721 us → 20.6 s busy over
+  `5973 / 53.75 = 111.1 s` → **18.6%**.
+
+So the honest range is **~19–31% FFN occupancy**, and the pace-setter is Attn's
+per-hop work. §23.6's arithmetic used 317 hops/s; the measured rate is 418
+(`27000 / 64.5`), and 418 × 2.66 ms was itself only accidentally near 1.0
+because the starved compute time was inflated. Two errors compounding in the
+same direction — the ratio looked like a saturated resource when it was not.
+
+### 25.4 Where the Attn scheduler's time goes
+
+`py-spy record` on the Attn `sglang::scheduler` at the corrected point (40 s,
+250 Hz, 7755 samples). Rollup:
+
+| bucket | share |
+|---|---|
+| attention (MLA) | 40.2% |
+| a2f (send/credit path) | 21.2% |
+| routing (gate + topk) | 13.2% |
+| attn_compute (`run_layer_forward_pre_ffn`) | 9.2% |
+| sched | 5.2% |
+| slice (window/sampling) | 4.4% |
+| unattributed | 6.7% |
+
+`slice` at **4.4% is the §22.3 slice cache visibly working** (it was 11.9% when
+§19.6 flagged it). Inside `a2f`, the leaves are flat — `unquant.apply` 4.7%
+(A2F quantization), `_clone_optional` 3.8%, `fill_a2f` 5.8% across its four
+branches, `scatter_rows` 2.7%, `wait_group` 1.9%, `synchronize` 1.7%:
+
+```
+367  4.73%  apply (quantization/unquant.py:155)
+291  3.75%  _clone_optional (afd/farm/attn_farm.py:618)
+206  2.66%  scatter_rows (afd/farm/batch_slice.py:299)
+179  2.31%  fill_a2f (afd/buffers.py:180)
+147  1.90%  wait_group (afd/farm/attn_farm.py:482)
+130  1.68%  synchronize (torch/cuda/streams.py:108)
+```
+
+No single dominant leaf: an eighth of the loss is spread over ~6 sub-3% items,
+which is why the previous micro-optimizations each bought only a few percent.
+
+**Caveat, stated because it bounds what this can support:** py-spy samples
+Python frames and cannot cleanly separate "CPU-busy" from "blocked in a CUDA
+sync that released the GIL". The 40% `attention` bucket is *where* the thread
+was, not proof that MLA is CPU-bound; some of it is GPU wait. §25.5 ranks by
+structure, not by this split.
+
+### 25.5 Consequence: the lever is Attn, and the structural one is amortisation
+
+With the FFN at ~31% and its 746 us hidden, per-hop *Attn* work (~1.4 ms, and
+spread across many small leaves) is what to attack. Micro-optimising one 3%
+leaf buys ~3%. The structural lever is **tokens per hop**: `mean_tok/launch = 6`
+means Attn's large fixed per-hop cost is amortised over only 6 tokens.
+
+`SGLANG_AFD_FARM_COALESCE_K` (default 1, "dequeue up to `COALESCE_K * B_step`
+tokens into one Attn launch") raises exactly that, and it was never A/B'd — no
+`COALESCE_K` experiment exists anywhere in this document. What blocked it
+before was §18's premise that the FFN was the saturated resource (a bigger hop
+would only queue behind it). §25.3 removes that premise: the FFN has ~69%
+headroom, so folding 2–4 hops into one should amortise Attn's per-hop cost
+while the FFN absorbs the extra compute in the idle it already has.
+
+This does **not** contradict §18/§20 — those measured FFN-side batching (bigger
+*FFN* batches for the FFN's benefit, `PerLayerBatchQueue`/`extra_gather`) and
+found it worthless. Here the beneficiary is the *other* process, which is only
+visible now that FFN occupancy is known to be 31% and not 84%.
+
+Ranked, with the §24 lesson (multiply the ratio by the absolute) applied:
+
+1. **`COALESCE_K` 1 → 2 → 4** at cfg-2. Highest expected value, zero new code,
+   directly targets the 79%-of-hop Attn share. Watch for the hop growing enough
+   that FFN compute stops being hidden (~2.5–3 ms/hop at K=4).
+2. A2F `fill_a2f` + `unquant` (~10% of Attn together): fuse the quantise/copy,
+   or skip quantisation when the scale path is inactive.
+3. `_clone_optional` in `enqueue` (3.8%) — §19's ~2.7% item, still there.
+
+### 25.6 Corrections this section makes
+
+- **§23.6 / §24's framing**: `ffn_compute_us` 2.66 ms and `317 hops/s * 2.66 ms
+  ≈ 84%` occupancy are void; the corrected values are 746 us and ~19–31%.
+  §24's *result* (F2A slot A/B = null) stands on its own A/B and is unaffected.
+- **§23.6's "the FFN hop, not the Attn host path, sets the pace"** is reversed.
+  §19/§22 were attacking the right process all along; the harness bug had
+  temporarily hidden that.
+- **§18's "no FFN-batching headroom"** was a statement about the FFN's *own*
+  benefit. It does not bound `COALESCE_K`, whose beneficiary is Attn.
+
+Reproduce: `ATTN_GPU=6 FFN_GPU=7 MODES=sticky NUM_PROMPTS=64 MAX_CONCURRENCY=16
+RANDOM_INPUT_LEN=128 RANDOM_OUTPUT_LEN=192 CONTEXT_LENGTH=4096
+SGLANG_AFD_FARM_MAX_INFLIGHT=8 SGLANG_AFD_NUM_MB=8
+SGLANG_AFD_FARM_MAX_INFLIGHT_PER_LAYER=1 SGLANG_AFD_FARM_SLICE_CACHE=1
+SGLANG_AFD_TIMELINE=1 [SGLANG_AFD_PROFILE_DETAIL=1] bash bench_farm_e2e.sh`
+(the harness supplies the §23.2 throttle + `--sleep-on-idle` by default).
