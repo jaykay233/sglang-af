@@ -133,7 +133,9 @@ apply_mode_env() {
 
   case "$mode" in
     sticky)
-      export SGLANG_AFD_FARM_COALESCE_K=1
+      # Overridable so the §25.5 amortisation sweep can raise tokens-per-hop
+      # without switching modes. Default 1 = legacy behaviour.
+      export SGLANG_AFD_FARM_COALESCE_K="${STICKY_COALESCE_K:-1}"
       ;;
     coalesce)
       export SGLANG_AFD_FARM_COALESCE_K="$COALESCE_K_THROUGHPUT"

@@ -1922,6 +1922,11 @@ Ranked, with the §24 lesson (multiply the ratio by the absolute) applied:
 1. **`COALESCE_K` 1 → 2 → 4** at cfg-2. Highest expected value, zero new code,
    directly targets the 79%-of-hop Attn share. Watch for the hop growing enough
    that FFN compute stops being hidden (~2.5–3 ms/hop at K=4).
+
+   > **Refined in §26.** `COALESCE_K` alone is inert: the take is owner-bounded,
+   > and at `num_contexts=2` the owner is only 8 rows (`B_STEP=8`). It pays only
+   > once the owner is widened — `num_contexts=1` + `COALESCE_K=2` measured
+   > **+32.9% tok/s / −26.8% TPOT**. Read §26 before running the sweep above.
 2. A2F `fill_a2f` + `unquant` (~10% of Attn together): fuse the quantise/copy,
    or skip quantisation when the scale path is inactive.
 3. `_clone_optional` in `enqueue` (3.8%) — §19's ~2.7% item, still there.
@@ -1943,3 +1948,102 @@ SGLANG_AFD_FARM_MAX_INFLIGHT=8 SGLANG_AFD_NUM_MB=8
 SGLANG_AFD_FARM_MAX_INFLIGHT_PER_LAYER=1 SGLANG_AFD_FARM_SLICE_CACHE=1
 SGLANG_AFD_TIMELINE=1 [SGLANG_AFD_PROFILE_DETAIL=1] bash bench_farm_e2e.sh`
 (the harness supplies the §23.2 throttle + `--sleep-on-idle` by default).
+
+## 26. Hop width: `num_contexts=1` + `COALESCE_K=2` = +33% tok/s, −27% TPOT
+
+§25.5 predicted `COALESCE_K` would help because Attn's per-hop cost is amortised
+over only ~6 tokens. It does — but **only in combination with a wider owner**,
+and the first sweep on its own was a measurement of a dead knob. Both halves are
+recorded because the failed half is what explains the mechanism.
+
+### 26.1 Sweep 1: `COALESCE_K` alone is inert (and why)
+
+`COALESCE_K` 1/2/4 at the §25 baseline (`num_contexts=2`, concurrency 16),
+2 reps, order reversed:
+
+| `COALESCE_K` | tok/s | med TPOT | `picks` | `tok/launch` |
+|---|---|---|---|---|
+| 1 | 100.96 / 100.88 | 126.7 / 127.5 | 27000 / 27000 | 6.0 / 6.0 |
+| 2 | 102.23 / 103.41 | 124.8 / 123.2 | 27000 / 27000 | 6.0 / 6.0 |
+| 4 | 101.74 / 100.88 | 126.0 / 127.4 | 27000 / 27000 | 6.0 / 6.0 |
+
+The farm's own counters are **bit-identical** across all three (`picks`,
+`tok/launch`), so the ±2% is noise and the knob did nothing. `coalesce_k=2` was
+verified present in the FFN's startup log, so this is not a config-plumbing
+failure.
+
+**Why:** `pick()` computes `max_tok = b_step * ck` and calls
+`_filtered_run` → `take_contiguous_run`, which takes the longest prefix of
+*token keys that belong to the same run* — same owner, consecutive `seq_idx`.
+The take is therefore `min(b_step * ck, owner_width)`, and with
+`num_contexts=2` at concurrency 16 each owner is only **8 rows**: for `ck >= 1`
+the take is owner-bounded at 8 and `ck` can never bind. `B_STEP=8` already
+equals the owner width, which is exactly why nothing moved.
+
+> Correction to §25.5 as written: it said the lever was "tokens per hop,
+> `mean_tok/launch = 6`". That is right, but the binding constraint is not the
+> `COALESCE_K` cap — it is the **owner width**, and `COALESCE_K` is a no-op until
+> the owner is wider than `b_step`.
+
+### 26.2 Sweep 2: widen the owner, then the cap binds
+
+Disentangling the two changes at `num_contexts=1` (concurrency 16 → one 16-row
+owner), 2 reps, order reversed:
+
+| arm | ctx | K | tok/s | med TPOT | `tok/launch` | `picks` |
+|---|---|---|---|---|---|---|
+| `base` | 2 | 1 | 103.03 / 100.98 | 124.7 / 127.1 | 6.0 | 27000 |
+| `c1k1` | 1 | 1 | 96.50 / 96.00 | 145.8 / 148.6 | 6.9 | 23706 |
+| `c1k2` | 1 | 2 | 133.45 / 133.02 | 94.2 / 94.0 | 10.0 | 16254 |
+| `c1k4` | 1 | 4 | **135.80 / 135.40** | **92.1 / 92.3** | 10.0 | 16254 |
+
+- **`c1k4` vs `base`: +32.9% tok/s, −26.8% TPOT.** `c1k2` is +30.6% / −25.2%.
+- `peak_layers_busy=2` in **every** arm, including all the `ctx=1` ones — the
+  win is not bought by giving up cross-layer overlap. (`mean_win_len` rises
+  1.00 → 1.47 and `B_win switches` falls 27000 → 16164, so windows are wider,
+  not fewer layers busy.)
+- `c1k4` and `c1k2` have **identical** `picks` (16254) and `tok/launch` (10.0):
+  raising the cap from 16 to 32 changes nothing because the 16-row owner binds.
+  That is the §26.1 mechanism confirmed from the other direction, and it is why
+  `k=2` is the sensible setting — `k=4` buys nothing but the 0.5–2% it shows is
+  within noise.
+- `c1k1` (owner widened, cap still 8) is **worse** than `base` (−5.6% / +17.0%)
+  despite 12% *fewer* hops. Fewer, heavier hops at an 8-row take is a bad trade;
+  the win needs the cap raised to match the owner. Not chased further — the
+  useful arms are unambiguous.
+- `contexts_per_stage=2` (contexts enter together "to share same-layer A2F
+  groups") was also tested with `ctx=2,K=2`: **84.8 / 85.0 tok/s = −16.9%**.
+  Entering together does not produce the shared A2F group the docstring
+  promises; do not use it.
+
+### 26.3 What this is
+
+Attn's per-hop cost is fixed and was being paid 27000 times for 6 tokens each.
+Paying it 16254 times for 10 tokens each is worth a third of the throughput.
+This is the §25.5 "amortise the fixed Attn cost" lever, now measured, and it is
+the largest single win since §19/§22's host-path fixes.
+
+Note this is **not** the FFN-side batching §18/§20 rejected. The FFN still serves
+one hop at a time; the change is that each hop carries more tokens. §25.3's 31%
+FFN occupancy is what makes it safe — but see the caveat below.
+
+**Caveat / scope.** Owner width is `n_seq / num_contexts`, so the optimal
+`(num_contexts, COALESCE_K)` pair is **concurrency-dependent**: at concurrency
+32, `ctx=2` already yields 16-row owners and `ctx=1` would yield 32. These
+numbers are for 1A1F at concurrency 16 only. Also unmeasured here: whether
+`ctx=1` still wins under the 2A1F asymmetric topology of §21, and whether a
+hop of 10 tokens grows FFN compute enough to stop being hidden (the §25.5
+watch item; `tok/launch` is 10, not the 16 the owner could supply, so the ready
+queue is the next thing to look at if this line continues).
+
+The in-tree defaults are still `num_contexts=2`, `COALESCE_K=1` — i.e. the
+configuration measured here as leaving ~33% on the table. Changing a default is
+a separate call; the measurement stands either way.
+
+Reproduce: `ATTN_GPU=6 FFN_GPU=7 MODES=sticky NUM_PROMPTS=64 MAX_CONCURRENCY=16
+RANDOM_INPUT_LEN=128 RANDOM_OUTPUT_LEN=192 CONTEXT_LENGTH=4096
+SGLANG_AFD_FARM_MAX_INFLIGHT=8 SGLANG_AFD_NUM_MB=8
+SGLANG_AFD_FARM_MAX_INFLIGHT_PER_LAYER=1 SGLANG_AFD_FARM_SLICE_CACHE=1
+SGLANG_AFD_FARM_NUM_CONTEXTS=<1|2> STICKY_COALESCE_K=<1|2|4>
+bash bench_farm_e2e.sh` (`STICKY_COALESCE_K` overrides `COALESCE_K` in the
+sticky mode; both are read at farm startup and echoed in the FFN log).
