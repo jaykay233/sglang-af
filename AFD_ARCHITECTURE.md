@@ -3,6 +3,11 @@
 范围：**当前正在运行**的实现（decode farm over cuda_ipc）。
 实测数字在 `progress.md`；本文只讲结构和流程。
 
+> 📊 **图文架构设计版见 [`AFD_DESIGN.md`](AFD_DESIGN.md)** —— 含拓扑图、职责边界、数据契约、
+> 状态机、设计不变量与 ADR，纯文本示意图，可直接复制到飞书等文档。
+> 另有面向汇报的 `AFD_REPORT.md`（架构 + 开销定位 + 优化杠杆，含 Mermaid 图，
+> 适合 GitHub / IDE 渲染）。
+
 ---
 
 ## 1. 拓扑
