@@ -53,6 +53,15 @@ if [[ -n "${ATTN_BACKEND:-}" ]]; then
   COMMON_ARGS+=(--attention-backend "$ATTN_BACKEND")
 fi
 
+# --sleep-on-idle parks the FFN scheduler's event_loop_overlap in a zmq poll
+# with the GIL released. Without it the FFN MainThread spins the WAR barrier
+# (torch.cuda.Stream.wait_stream) every iteration and starves the
+# `afd-ffn-serve` compute thread (progress.md §15.7).
+declare -a FFN_IDLE_ARGS=()
+if [[ "${SGLANG_AFD_FFN_SLEEP_ON_IDLE:-1}" == "1" ]]; then
+  FFN_IDLE_ARGS+=(--sleep-on-idle)
+fi
+
 kill_ports() {
   local attn_port=$1 ffn_port=$2
   local killed=0
@@ -107,6 +116,13 @@ apply_mode_env() {
   export SGLANG_AFD_FARM_MAX_INFLIGHT="${SGLANG_AFD_FARM_MAX_INFLIGHT:-2}"
   export SGLANG_AFD_NUM_MB="${SGLANG_AFD_NUM_MB:-2}"
   export SGLANG_AFD_FARM_MAX_INFLIGHT_PER_LAYER="${SGLANG_AFD_FARM_MAX_INFLIGHT_PER_LAYER:-0}"
+  # The FFN process never serves a real request, but without a throttle its
+  # scheduler MainThread runs the full `on_idle` pass every loop iteration
+  # (invariant checks + publish_load_snapshot) holding the GIL, starving the
+  # FFN compute thread (progress.md §15.4). bench_pool_e2e.sh already applies
+  # this and §15.7's --sleep-on-idle; this harness did not, so every §19/§22
+  # farm A/B ran GIL-starved. Override to 0 to reproduce the old behaviour.
+  export SGLANG_IDLE_HOUSEKEEPING_INTERVAL_MS="${SGLANG_IDLE_HOUSEKEEPING_INTERVAL_MS:-250}"
   # Prefill A2F pad ≥ max hop tokens; with FFN_CG=0 Lite cost is MiB-scale.
   export SGLANG_AFD_MAX_NUM_TOKEN="${SGLANG_AFD_MAX_NUM_TOKEN:-256}"
   export SGLANG_AFD_FARM_LOG_EVERY=32
@@ -168,6 +184,7 @@ start_af_farm() {
     export SGLANG_AFD_MODE=ffn SGLANG_AFD_RELEASE_UNUSED_PARAMS=1
     export CUDA_VISIBLE_DEVICES="$FFN_GPU"
     python3 -m sglang.launch_server "${COMMON_ARGS[@]}" \
+      "${FFN_IDLE_ARGS[@]}" \
       --port "$FFN_PORT" --skip-server-warmup
   ) >"$log/ffn.log" 2>&1 &
   echo $! >>"$OUT_DIR/$tag.pids"

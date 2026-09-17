@@ -1613,3 +1613,105 @@ RANDOM_INPUT_LEN=128 RANDOM_OUTPUT_LEN=192 CONTEXT_LENGTH=4096
 SGLANG_AFD_FARM_MAX_INFLIGHT=8 SGLANG_AFD_NUM_MB=8
 SGLANG_AFD_FARM_MAX_INFLIGHT_PER_LAYER=1 SGLANG_AFD_FARM_SLICE_CACHE=<0|1>
 bash bench_farm_e2e.sh`
+
+## 23. The farm harness was GIL-starving the FFN: +44% tok/s, −29% TPOT
+
+§15 found and fixed the FFN process's GIL contention — but **only
+`bench_pool_e2e.sh` ever applied the fix**. `bench_farm_e2e.sh`, the harness that
+produced all of §19 and §22, set neither
+`SGLANG_IDLE_HOUSEKEEPING_INTERVAL_MS` nor `--sleep-on-idle`. Every farm A/B in
+this document therefore ran against a crippled FFN.
+
+### 23.1 How it surfaced
+
+Profiling the A2F send path (§19.6 lever #2) turned out to be the wrong lead: at
+cfg-2 the remaining A2F host work is ~12% of farm time, and most of it is
+irreducible copies. Pulling the per-hop cross-process timeline instead showed the
+hop is **not** hidden — `respond_to_wait_enter_us` p50 is only 71 us, i.e. Attn
+gets back to the wait *before* the result is ready:
+
+| per-hop (p50, cfg-2, TIMELINE only) | us |
+|---|---|
+| post → ffn | 640 |
+| **ffn compute** | **2661** |
+| ffn → respond | 23 |
+| respond → wait_enter | 71 |
+| wait_enter → done | 21 |
+| **total_rt** | **3446** |
+
+93 ms/token of the ~180 ms TPOT is hop time, and 77% of the hop is FFN. So the
+FFN, not the Attn host path, is the critical path.
+
+`py-spy record` on the FFN `sglang::scheduler` at that point:
+
+| thread | samples | where |
+|---|---|---|
+| **MainThread** | **56%** | `_apply_war_barrier` → `Stream.wait_stream` / `record_event` |
+| `afd-ffn-serve` (compute) | 44% | `run_same_layer_fused` → `ffn_apply_experts` |
+
+That is §15's exact signature, from a harness that was supposed to have fixed it.
+
+### 23.2 Fix
+
+`bench_farm_e2e.sh` now mirrors `bench_pool_e2e.sh`:
+`SGLANG_IDLE_HOUSEKEEPING_INTERVAL_MS` defaults to `250` and the FFN server is
+launched with `--sleep-on-idle`. Both are overridable, so setting them to `0`
+reproduces the starved behaviour for A/B.
+
+### 23.3 Measured (cfg-2: 64 prompts, conc 16, MAX_INFLIGHT=8, per-layer cap 1)
+
+2 reps, order reversed on rep 2, CG off, `SLICE_CACHE=1` in both arms:
+
+| arm | tok/s | med TPOT ms |
+|---|---|---|
+| old (throttle 0, no `--sleep-on-idle`) | 67.83 / 73.97 | 182.9 / 170.7 |
+| new (throttle 250 ms + `--sleep-on-idle`) | **102.54 / 101.95** | **125.2 / 125.6** |
+| **delta** | **+44%** | **−29%** |
+
+Ranges do not overlap. The corrected baseline (102.3) lands on §18's numbers
+(105.3 base / 107.0 bothq), which is the cross-check that this restores the
+operating point §18 and §19 were actually measured at — §18's config line does
+list `IDLE_HOUSEKEEPING_INTERVAL_MS=250`, `FFN_SLEEP_ON_IDLE=1`. §19 is therefore
+unaffected; **§22.3 is not** (see §23.4).
+
+### 23.4 Consequence: §22.3's slice-cache number is invalid as stated
+
+§22.3's A/B ran at 72.2 → 75.3 tok/s, i.e. entirely inside the starved regime.
+Its "+4.4% / −3.6%" is a real measurement of a *GIL-bound* farm and must not be
+quoted as the slice cache's value at the intended operating point. Re-run
+under §23.2 follows in §23.5.
+
+The general lesson, and the reason this section exists: **a config that is
+host-bound enough to show a host-path win is often also a config whose FFN is
+GIL-starved.** `MAX_INFLIGHT=8` + per-layer cap 1 is exactly such a point. Any
+farm A/B from here on must state the throttle and `--sleep-on-idle` settings, the
+same way §22.3 required stating `MAX_INFLIGHT` and the per-layer cap.
+
+### 23.5 Re-check: the window-slice cache is still a win, and bigger
+
+§22.3's A/B re-run with the §23.2 harness fix, same cfg-2 point, 2 reps,
+order reversed on rep 2:
+
+| arm | tok/s | med TPOT ms |
+|---|---|---|
+| `SLICE_CACHE=0` | 93.87 / 94.45 | 136.5 / 135.5 |
+| `SLICE_CACHE=1` | **101.43 / 101.71** | **126.5 / 125.9** |
+| **delta** | **+7.9%** | **−7.2%** |
+
+Ranges do not overlap, and `on` is the tighter of the two. So:
+
+- **§22.3's conclusion survives** — build the child `ForwardBatch` once per
+  `(window, forward)`, not once per hop. The mechanism ("recomputation removed,
+  not work deferred") is unchanged; `picks` was identical in both arms there.
+- **Its magnitude was understated**, because 72 tok/s was deep in the starved
+  regime where the FFN, not the Attn host, set the pace. At the corrected point
+  the same host-side saving is worth ~1.8x what §22.3 recorded.
+- The `MAX_INFLIGHT=8` + per-layer cap 1 config is host-bound *and* was
+  GIL-starved. Those two properties are easy to conflate; §23.4's warning stands.
+
+Reproduce: `ATTN_GPU=6 FFN_GPU=7 MODES=sticky NUM_PROMPTS=64 MAX_CONCURRENCY=16
+RANDOM_INPUT_LEN=128 RANDOM_OUTPUT_LEN=192 CONTEXT_LENGTH=4096
+SGLANG_AFD_FARM_MAX_INFLIGHT=8 SGLANG_AFD_NUM_MB=8
+SGLANG_AFD_FARM_MAX_INFLIGHT_PER_LAYER=1 SGLANG_AFD_FARM_SLICE_CACHE=<0|1>
+bash bench_farm_e2e.sh` — with `SGLANG_IDLE_HOUSEKEEPING_INTERVAL_MS` and
+`SGLANG_AFD_FFN_SLEEP_ON_IDLE` left at their new defaults.
